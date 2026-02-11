@@ -72,19 +72,21 @@ void isolateEntry(InitRequest initReq) async {
 
   try {
     final options = InterpreterOptions()..threads = 4;
+    
+    // Attempt GPU Delegate
     if (Platform.isAndroid) {
       try {
-        // Attempt GPU with safe options
         options.addDelegate(GpuDelegateV2(
           options: GpuDelegateOptionsV2(
-            isPrecisionLossAllowed: true, // Allow FP16 for speed
-            // inferencePreference: TfLiteGpuInferenceUsage.fastSingleAnswer, // Not available in Dart definition
+            isPrecisionLossAllowed: true, // Allow FP16
           )
         ));
+        print("GPU Delegate initialized successfully");
       } catch (e) {
-        print("Isolate GPU Error: $e");
+        print("GPU Delegate failed, falling back to CPU: $e");
       }
     }
+    
     interpreter = Interpreter.fromBuffer(initReq.modelBytes, options: options);
     interpreter.allocateTensors();
     inputTensor = interpreter.getInputTensors().first;
@@ -93,26 +95,50 @@ void isolateEntry(InitRequest initReq) async {
     print("Isolate Init Error: $e");
   }
 
+  // Pre-allocate buffer for float32 input (avoid GC churn)
+  final inputFloatBuffer = Float32List(kInputSize * kInputSize * 3);
+  // For Int8 models, you would use: final inputIntBuffer = Uint8List(kInputSize * kInputSize * 3);
+
   await for (final message in receivePort) {
     if (message is FrameRequest) {
        if (interpreter == null) continue;
        
-       final sw = Stopwatch()..start();
+       int preprocessTime = 0;
+       int inferenceTime = 0;
+       int postprocessTime = 0;
+
        try {
          // 1. Preprocess
-         final inputBytes = _preprocess(message);
+         final swPre = Stopwatch()..start();
+         // Reuse buffer
+         _preprocess(message, inputFloatBuffer);
+         final inputBytes = inputFloatBuffer.buffer.asUint8List(); 
+         swPre.stop();
+         preprocessTime = swPre.elapsedMilliseconds;
          
          // 2. Inference
+         final swInf = Stopwatch()..start();
          inputTensor!.setTo(inputBytes);
          interpreter.invoke();
          outputTensor!.copyTo(outputBuffer.buffer.asUint8List());
+         swInf.stop();
+         inferenceTime = swInf.elapsedMilliseconds;
          
          // 3. Postprocess
+         final swPost = Stopwatch()..start();
          final detections = postProcess(outputBuffer);
-         sw.stop();
+         swPost.stop();
+         postprocessTime = swPost.elapsedMilliseconds;
          
          // Send Results back
-         initReq.sendPort.send(InferenceResult(message.id, detections, sw.elapsedMilliseconds));
+         initReq.sendPort.send(InferenceResult(
+             message.id, 
+             detections, 
+             preprocessTime + inferenceTime + postprocessTime,
+             preprocessTime,
+             inferenceTime,
+             postprocessTime
+         ));
        } catch (e) {
          print("Pipeline Error: $e");
        }
@@ -120,67 +146,133 @@ void isolateEntry(InitRequest initReq) async {
   }
 }
 
-// Optimized Preprocessing (Integer Math + Rotation)
-Uint8List _preprocess(FrameRequest req) {
-  // Returns bytes for Float32 input tensor
-  final totalElements = kInputSize * kInputSize * 3;
-  final float32Data = Float32List(totalElements);
-  
+// Optimized Preprocessing (Separate loops for rotation + Inline Math + Buffer Reuse)
+void _preprocess(FrameRequest req, Float32List float32Data) {
   final int inW = req.width;
   final int inH = req.height;
-  
-  for (int outY = 0; outY < kInputSize; outY++) {
-    for (int outX = 0; outX < kInputSize; outX++) {
-      int srcX, srcY;
+  final int inW_1 = inW - 1;
+  final int inH_1 = inH - 1;
 
-      // Map output (outX, outY) to input (srcX, srcY) based on rotation
-      switch (req.rotation) {
-        case 90: // Portrait Up (Standard)
-          srcX = (outY * inW) ~/ kInputSize;
-          srcY = ((kInputSize - 1 - outX) * inH) ~/ kInputSize;
-          break;
-        case 270: // Portrait Down
-        case -90:
-          srcX = ((kInputSize - 1 - outY) * inW) ~/ kInputSize;
-          srcY = (outX * inH) ~/ kInputSize;
-          break;
-        case 180: // Landscape Right
-          srcX = ((kInputSize - 1 - outX) * inW) ~/ kInputSize;
-          srcY = ((kInputSize - 1 - outY) * inH) ~/ kInputSize;
-          break;
-        case 0: // Landscape Left
-        default:
-          srcX = (outX * inW) ~/ kInputSize;
-          srcY = (outY * inH) ~/ kInputSize;
-          break;
+  final yPlane = req.yPlane;
+  final uPlane = req.uPlane;
+  final vPlane = req.vPlane;
+  final yRowStride = req.yRowStride;
+  final uvRowStride = req.uvRowStride;
+  final uvPixelStride = req.uvPixelStride;
+
+  int pixelIdx = 0;
+
+  // Optimized loops based on rotation to avoid per-pixel switch
+  if (req.rotation == 90) { 
+    // Portrait Up
+    for (int outY = 0; outY < kInputSize; outY++) {
+      final int srcX = (outY * inW) ~/ kInputSize;
+      final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
+      
+      for (int outX = 0; outX < kInputSize; outX++) {
+         final int srcY = ((kInputSize - 1 - outX) * inH) ~/ kInputSize;
+         final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
+
+         _convertYuvToRgb(
+             yPlane, uPlane, vPlane, 
+             srcX_clamped, srcY_clamped, 
+             yRowStride, uvRowStride, uvPixelStride, 
+             float32Data, pixelIdx
+         );
+         pixelIdx += 3;
       }
+    }
+  } else if (req.rotation == 270) {
+    // Portrait Down
+    for (int outY = 0; outY < kInputSize; outY++) {
+      final int srcX = ((kInputSize - 1 - outY) * inW) ~/ kInputSize;
+      final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
 
-      // Safe clamp
-      if (srcX < 0) srcX = 0; else if (srcX >= inW) srcX = inW - 1;
-      if (srcY < 0) srcY = 0; else if (srcY >= inH) srcY = inH - 1;
+      for (int outX = 0; outX < kInputSize; outX++) {
+        final int srcY = (outX * inH) ~/ kInputSize;
+        final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
 
-      final int yIdx = srcY * req.yRowStride + srcX;
-      final int uvIdx = (srcY ~/ 2) * req.uvRowStride + (srcX ~/ 2) * req.uvPixelStride;
+        _convertYuvToRgb(
+            yPlane, uPlane, vPlane,
+            srcX_clamped, srcY_clamped,
+            yRowStride, uvRowStride, uvPixelStride,
+            float32Data, pixelIdx
+        );
+        pixelIdx += 3;
+      }
+    }
+  } else if (req.rotation == 180) {
+     // Landscape Right
+     for (int outY = 0; outY < kInputSize; outY++) {
+       final int srcY = ((kInputSize - 1 - outY) * inH) ~/ kInputSize;
+       final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
 
-      // Bound checks
-      if (yIdx >= req.yPlane.length || uvIdx >= req.uPlane.length || uvIdx >= req.vPlane.length) continue;
+       for (int outX = 0; outX < kInputSize; outX++) {
+         final int srcX = ((kInputSize - 1 - outX) * inW) ~/ kInputSize;
+         final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
 
-      final int yVal = req.yPlane[yIdx];
-      final int uVal = req.uPlane[uvIdx] - 128; // 0..255 -> -128..127
-      final int vVal = req.vPlane[uvIdx] - 128;
+         _convertYuvToRgb(
+             yPlane, uPlane, vPlane,
+             srcX_clamped, srcY_clamped,
+             yRowStride, uvRowStride, uvPixelStride,
+             float32Data, pixelIdx
+         );
+         pixelIdx += 3;
+       }
+     }
+  } else {
+    // Landscape Left (0) or default
+    for (int outY = 0; outY < kInputSize; outY++) {
+      final int srcY = (outY * inH) ~/ kInputSize;
+      final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
 
-      // Integer RGB conversion
-      int r = (yVal + (1404 * vVal >> 10)).clamp(0, 255);
-      int g = (yVal - (346 * uVal >> 10) - (715 * vVal >> 10)).clamp(0, 255);
-      int b = (yVal + (1774 * uVal >> 10)).clamp(0, 255);
+      for (int outX = 0; outX < kInputSize; outX++) {
+        final int srcX = (outX * inW) ~/ kInputSize;
+        final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
 
-      final int pixelIdx = (outY * kInputSize + outX) * 3;
-      float32Data[pixelIdx] = r / 255.0;
-      float32Data[pixelIdx + 1] = g / 255.0;
-      float32Data[pixelIdx + 2] = b / 255.0;
+        _convertYuvToRgb(
+            yPlane, uPlane, vPlane,
+            srcX_clamped, srcY_clamped,
+            yRowStride, uvRowStride, uvPixelStride,
+            float32Data, pixelIdx
+        );
+        pixelIdx += 3;
+      }
     }
   }
-  return float32Data.buffer.asUint8List();
+}
+
+// Inline-friendly helper for YUV -> RGB -> Float32
+@pragma('vm:prefer-inline')
+void _convertYuvToRgb(
+    Uint8List yPlane, Uint8List uPlane, Uint8List vPlane,
+    int x, int y,
+    int yRowStride, int uvRowStride, int uvPixelStride,
+    Float32List outBuffer, int outOffset) {
+  
+  final int yIdx = y * yRowStride + x;
+  final int uvIdx = (y >> 1) * uvRowStride + (x >> 1) * uvPixelStride;
+
+  final int yVal = yPlane[yIdx];
+  final int uVal = uPlane[uvIdx] - 128; 
+  final int vVal = vPlane[uvIdx] - 128;
+
+  // Integer RGB conversion (standard coefficients)
+  // R = Y + 1.402 * V
+  // G = Y - 0.344136 * U - 0.714136 * V
+  // B = Y + 1.772 * U
+  
+  int r = yVal + ((1436 * vVal) >> 10);
+  int g = yVal - ((352 * uVal + 731 * vVal) >> 10);
+  int b = yVal + ((1814 * uVal) >> 10);
+
+  if (r < 0) r = 0; else if (r > 255) r = 255;
+  if (g < 0) g = 0; else if (g > 255) g = 255;
+  if (b < 0) b = 0; else if (b > 255) b = 255;
+
+  outBuffer[outOffset] = r / 255.0;
+  outBuffer[outOffset + 1] = g / 255.0;
+  outBuffer[outOffset + 2] = b / 255.0;
 }
 
 // ─── Post-processing ──────────────────────────────────────────────
@@ -252,7 +344,12 @@ class InferenceResult {
   final int id;
   final List<DetectionResult> detections;
   final int inferenceTime;
-  InferenceResult(this.id, this.detections, this.inferenceTime);
+  final int preprocessTime;
+  final int inferenceOnlyTime;
+  final int postprocessTime;
+
+  InferenceResult(this.id, this.detections, this.inferenceTime, 
+      [this.preprocessTime = 0, this.inferenceOnlyTime = 0, this.postprocessTime = 0]);
 }
 
 // ─── App Entry ────────────────────────────────────────────────────
@@ -306,6 +403,8 @@ class _DetectionScreenState extends State<DetectionScreen> with WidgetsBindingOb
   int _frameCount = 0;
   DateTime _lastFpsTime = DateTime.now();
   int _inferenceMs = 0;
+  int _preprocessMs = 0;
+  int _postprocessMs = 0;
   
   bool _isProcessing = false;
 
@@ -401,7 +500,9 @@ class _DetectionScreenState extends State<DetectionScreen> with WidgetsBindingOb
     if (!mounted) return;
     setState(() {
       _detections = result.detections;
-      _inferenceMs = result.inferenceTime;
+      _inferenceMs = result.inferenceOnlyTime; // Show pure inference time
+      _preprocessMs = result.preprocessTime;
+      _postprocessMs = result.postprocessTime;
       _frameCount++;
       final now = DateTime.now();
       final elapsed = now.difference(_lastFpsTime).inMilliseconds;
@@ -465,7 +566,13 @@ class _DetectionScreenState extends State<DetectionScreen> with WidgetsBindingOb
       child: Padding(padding: const EdgeInsets.all(16), child: 
         Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
           const Text('Dental AI', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 20)),
-          Text('${_inferenceMs}ms  $_fps FPS', style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+          Column(
+             crossAxisAlignment: CrossAxisAlignment.end,
+             children: [
+                Text('$_fps FPS', style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 18)),
+                Text('Pre: ${_preprocessMs}ms  Inf: ${_inferenceMs}ms  Post: ${_postprocessMs}ms', style: const TextStyle(color: Colors.white70, fontSize: 10)),
+             ]
+          )
         ])
       )
     )
