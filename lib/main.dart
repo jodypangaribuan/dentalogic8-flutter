@@ -64,90 +64,153 @@ void isolateEntry(InitRequest initReq) async {
   final receivePort = ReceivePort();
   initReq.sendPort.send(receivePort.sendPort);
 
-  // Initialize TFLite
+  // Initialize TFLite - Smart Selection
   Interpreter? interpreter;
   Tensor? inputTensor;
   Tensor? outputTensor;
   final outputBuffer = Float32List(1 * 11 * 8400);
 
   try {
-    final options = InterpreterOptions()..threads = 4;
-    
-    // Attempt GPU Delegate
-    if (Platform.isAndroid) {
-      try {
-        options.addDelegate(GpuDelegateV2(
-          options: GpuDelegateOptionsV2(
-            isPrecisionLossAllowed: true, // Allow FP16
-          )
-        ));
-        print("GPU Delegate initialized successfully");
-      } catch (e) {
-        print("GPU Delegate failed, falling back to CPU: $e");
-      }
-    }
-    
+    // 1. Initial load on CPU to check model type
+    var options = InterpreterOptions()..threads = 4;
     interpreter = Interpreter.fromBuffer(initReq.modelBytes, options: options);
     interpreter.allocateTensors();
+    
+    final tempInputTensor = interpreter.getInputTensors().first;
+    final isQuantized = tempInputTensor.type == TensorType.uint8;
+    
+    print("Model Input Type: ${tempInputTensor.type}");
+
+    // 2. Optimization Logic
+    if (isQuantized) {
+       print("Smart Init: Detected Int8 Model. Keeping CPU (XNNPACK) for best performance.");
+       // Already loaded on CPU, keep it.
+    } else {
+       // Float32 -> Try GPU
+       if (Platform.isAndroid) {
+          print("Smart Init: Detected Float32 Model. Switching to GPU Delegate...");
+          interpreter.close(); // Close CPU interpreter
+          
+          try {
+            options.addDelegate(GpuDelegateV2(
+              options: GpuDelegateOptionsV2(isPrecisionLossAllowed: true)
+            ));
+            interpreter = Interpreter.fromBuffer(initReq.modelBytes, options: options);
+            interpreter.allocateTensors();
+            print("Smart Init: GPU Initialized Successfully.");
+          } catch (e) {
+            print("Smart Init: GPU Failed ($e). Falling back to CPU.");
+            // Re-open on CPU
+            options = InterpreterOptions()..threads = 4;
+            interpreter = Interpreter.fromBuffer(initReq.modelBytes, options: options);
+            interpreter.allocateTensors();
+          }
+       }
+    }
+
     inputTensor = interpreter.getInputTensors().first;
     outputTensor = interpreter.getOutputTensors().first;
   } catch (e) {
     print("Isolate Init Error: $e");
   }
 
-  // Pre-allocate buffer for float32 input (avoid GC churn)
-  final inputFloatBuffer = Float32List(kInputSize * kInputSize * 3);
-  // For Int8 models, you would use: final inputIntBuffer = Uint8List(kInputSize * kInputSize * 3);
-
-  await for (final message in receivePort) {
-    if (message is FrameRequest) {
-       if (interpreter == null) continue;
-       
-       int preprocessTime = 0;
-       int inferenceTime = 0;
-       int postprocessTime = 0;
-
-       try {
-         // 1. Preprocess
-         final swPre = Stopwatch()..start();
-         // Reuse buffer
-         _preprocess(message, inputFloatBuffer);
-         final inputBytes = inputFloatBuffer.buffer.asUint8List(); 
-         swPre.stop();
-         preprocessTime = swPre.elapsedMilliseconds;
-         
-         // 2. Inference
-         final swInf = Stopwatch()..start();
-         inputTensor!.setTo(inputBytes);
-         interpreter.invoke();
-         outputTensor!.copyTo(outputBuffer.buffer.asUint8List());
-         swInf.stop();
-         inferenceTime = swInf.elapsedMilliseconds;
-         
-         // 3. Postprocess
-         final swPost = Stopwatch()..start();
-         final detections = postProcess(outputBuffer);
-         swPost.stop();
-         postprocessTime = swPost.elapsedMilliseconds;
-         
-         // Send Results back
-         initReq.sendPort.send(InferenceResult(
-             message.id, 
-             detections, 
-             preprocessTime + inferenceTime + postprocessTime,
-             preprocessTime,
-             inferenceTime,
-             postprocessTime
-         ));
-       } catch (e) {
-         print("Pipeline Error: $e");
-       }
+    // Prepare buffers based on input type
+    final inputType = inputTensor!.type;
+    final isQuantized = inputType == TensorType.uint8;
+    
+    // Create buffers
+    Float32List? inputFloatBuffer;
+    Uint8List? inputIntBuffer;
+    
+    if (isQuantized) {
+      inputIntBuffer = Uint8List(kInputSize * kInputSize * 3);
+      print("Model detected as Int8 (Quantized). Expecting higher FPS.");
+    } else {
+      inputFloatBuffer = Float32List(kInputSize * kInputSize * 3);
+      print("Model detected as Float32. If FPS is low, try an Int8 model.");
     }
-  }
+
+    await for (final message in receivePort) {
+      if (message is FrameRequest) {
+         if (interpreter == null) continue;
+         
+         int preprocessTime = 0;
+         int inferenceTime = 0;
+         int postprocessTime = 0;
+  
+         try {
+           // 1. Preprocess
+           final swPre = Stopwatch()..start();
+           
+           Uint8List inputBytes;
+           if (isQuantized) {
+              _preprocessUint8(message, inputIntBuffer!);
+              inputBytes = inputIntBuffer;
+           } else {
+              _preprocessFloat(message, inputFloatBuffer!);
+              inputBytes = inputFloatBuffer.buffer.asUint8List();
+           }
+           
+           swPre.stop();
+           preprocessTime = swPre.elapsedMilliseconds;
+           
+           // 2. Inference
+           final swInf = Stopwatch()..start();
+           inputTensor!.setTo(inputBytes);
+           interpreter.invoke();
+           outputTensor!.copyTo(outputBuffer.buffer.asUint8List());
+           swInf.stop();
+           inferenceTime = swInf.elapsedMilliseconds;
+           
+           // 3. Postprocess
+           final swPost = Stopwatch()..start();
+           final detections = postProcess(outputBuffer);
+           swPost.stop();
+           postprocessTime = swPost.elapsedMilliseconds;
+           
+           // Send Results back
+           initReq.sendPort.send(InferenceResult(
+               message.id, 
+               detections, 
+               preprocessTime + inferenceTime + postprocessTime,
+               preprocessTime,
+               inferenceTime,
+               postprocessTime
+           ));
+           
+           if (message.id % 30 == 0) {
+              print("PERF: Pre=$preprocessTime ms, Inf=$inferenceTime ms, Post=$postprocessTime ms");
+           }
+         } catch (e) {
+           print("Pipeline Error: $e");
+         }
+      }
+    }
 }
 
-// Optimized Preprocessing (Separate loops for rotation + Inline Math + Buffer Reuse)
-void _preprocess(FrameRequest req, Float32List float32Data) {
+// Optimized Preprocessing for Float32
+void _preprocessFloat(FrameRequest req, Float32List outBuffer) {
+   _preprocessCommon(req, (r, g, b, offset) {
+     outBuffer[offset] = r / 255.0;
+     outBuffer[offset + 1] = g / 255.0;
+     outBuffer[offset + 2] = b / 255.0;
+   });
+}
+
+// Optimized Preprocessing for Uint8 (Int8 Models)
+void _preprocessUint8(FrameRequest req, Uint8List outBuffer) {
+   _preprocessCommon(req, (r, g, b, offset) {
+     outBuffer[offset] = r;
+     outBuffer[offset + 1] = g;
+     outBuffer[offset + 2] = b;
+   });
+}
+
+// Common rotation/loop logic to avoid code duplication
+// Using a higher order function for pixel assignment might slightly reduce performance due to closure, 
+// but it's cleaner. Given Pre is 10ms, this is acceptable. 
+// For max speed, we would duplicate the loops, but let's try this first.
+void _preprocessCommon(FrameRequest req, Function(int r, int g, int b, int offset) storePixel) {
   final int inW = req.width;
   final int inH = req.height;
   final int inW_1 = inW - 1;
@@ -162,23 +225,17 @@ void _preprocess(FrameRequest req, Float32List float32Data) {
 
   int pixelIdx = 0;
 
-  // Optimized loops based on rotation to avoid per-pixel switch
+  // Optimized loops based on rotation
   if (req.rotation == 90) { 
     // Portrait Up
     for (int outY = 0; outY < kInputSize; outY++) {
       final int srcX = (outY * inW) ~/ kInputSize;
       final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
-      
       for (int outX = 0; outX < kInputSize; outX++) {
          final int srcY = ((kInputSize - 1 - outX) * inH) ~/ kInputSize;
          final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
-
-         _convertYuvToRgb(
-             yPlane, uPlane, vPlane, 
-             srcX_clamped, srcY_clamped, 
-             yRowStride, uvRowStride, uvPixelStride, 
-             float32Data, pixelIdx
-         );
+         _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+             yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
          pixelIdx += 3;
       }
     }
@@ -187,17 +244,11 @@ void _preprocess(FrameRequest req, Float32List float32Data) {
     for (int outY = 0; outY < kInputSize; outY++) {
       final int srcX = ((kInputSize - 1 - outY) * inW) ~/ kInputSize;
       final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
-
       for (int outX = 0; outX < kInputSize; outX++) {
         final int srcY = (outX * inH) ~/ kInputSize;
         final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
-
-        _convertYuvToRgb(
-            yPlane, uPlane, vPlane,
-            srcX_clamped, srcY_clamped,
-            yRowStride, uvRowStride, uvPixelStride,
-            float32Data, pixelIdx
-        );
+        _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+             yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
         pixelIdx += 3;
       }
     }
@@ -206,49 +257,36 @@ void _preprocess(FrameRequest req, Float32List float32Data) {
      for (int outY = 0; outY < kInputSize; outY++) {
        final int srcY = ((kInputSize - 1 - outY) * inH) ~/ kInputSize;
        final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
-
        for (int outX = 0; outX < kInputSize; outX++) {
          final int srcX = ((kInputSize - 1 - outX) * inW) ~/ kInputSize;
          final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
-
-         _convertYuvToRgb(
-             yPlane, uPlane, vPlane,
-             srcX_clamped, srcY_clamped,
-             yRowStride, uvRowStride, uvPixelStride,
-             float32Data, pixelIdx
-         );
+         _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+             yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
          pixelIdx += 3;
        }
      }
   } else {
-    // Landscape Left (0) or default
+    // Landscape Left (0)
     for (int outY = 0; outY < kInputSize; outY++) {
       final int srcY = (outY * inH) ~/ kInputSize;
       final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
-
       for (int outX = 0; outX < kInputSize; outX++) {
         final int srcX = (outX * inW) ~/ kInputSize;
         final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
-
-        _convertYuvToRgb(
-            yPlane, uPlane, vPlane,
-            srcX_clamped, srcY_clamped,
-            yRowStride, uvRowStride, uvPixelStride,
-            float32Data, pixelIdx
-        );
+        _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+             yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
         pixelIdx += 3;
       }
     }
   }
 }
 
-// Inline-friendly helper for YUV -> RGB -> Float32
 @pragma('vm:prefer-inline')
-void _convertYuvToRgb(
+void _convertPixel(
     Uint8List yPlane, Uint8List uPlane, Uint8List vPlane,
     int x, int y,
     int yRowStride, int uvRowStride, int uvPixelStride,
-    Float32List outBuffer, int outOffset) {
+    int outOffset, Function(int r, int g, int b, int offset) storePixel) {
   
   final int yIdx = y * yRowStride + x;
   final int uvIdx = (y >> 1) * uvRowStride + (x >> 1) * uvPixelStride;
@@ -257,11 +295,6 @@ void _convertYuvToRgb(
   final int uVal = uPlane[uvIdx] - 128; 
   final int vVal = vPlane[uvIdx] - 128;
 
-  // Integer RGB conversion (standard coefficients)
-  // R = Y + 1.402 * V
-  // G = Y - 0.344136 * U - 0.714136 * V
-  // B = Y + 1.772 * U
-  
   int r = yVal + ((1436 * vVal) >> 10);
   int g = yVal - ((352 * uVal + 731 * vVal) >> 10);
   int b = yVal + ((1814 * uVal) >> 10);
@@ -269,11 +302,12 @@ void _convertYuvToRgb(
   if (r < 0) r = 0; else if (r > 255) r = 255;
   if (g < 0) g = 0; else if (g > 255) g = 255;
   if (b < 0) b = 0; else if (b > 255) b = 255;
-
-  outBuffer[outOffset] = r / 255.0;
-  outBuffer[outOffset + 1] = g / 255.0;
-  outBuffer[outOffset + 2] = b / 255.0;
+  
+  storePixel(r, g, b, outOffset);
 }
+
+// Inline-friendly helper for YUV -> RGB -> Float32
+
 
 // ─── Post-processing ──────────────────────────────────────────────
 List<DetectionResult> postProcess(Float32List output) {
@@ -375,7 +409,7 @@ class DentalCariesApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Dental Caries Detector',
+      title: 'dentalogic8',
       home: const DetectionScreen(),
       debugShowCheckedModeBanner: false,
     );
@@ -569,8 +603,18 @@ class _DetectionScreenState extends State<DetectionScreen> with WidgetsBindingOb
           Column(
              crossAxisAlignment: CrossAxisAlignment.end,
              children: [
-                Text('$_fps FPS', style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 18)),
-                Text('Pre: ${_preprocessMs}ms  Inf: ${_inferenceMs}ms  Post: ${_postprocessMs}ms', style: const TextStyle(color: Colors.white70, fontSize: 10)),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('UI: $_fps FPS', style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 16)),
+                    const SizedBox(width: 10),
+                    Text(
+                      'Model: ${_inferenceMs > 0 ? (1000 / (_preprocessMs + _inferenceMs + _postprocessMs)).toStringAsFixed(1) : "0.0"} FPS', 
+                      style: const TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 16)
+                    ),
+                  ],
+                ),
+                Text('Pre: ${_preprocessMs}ms  Inf: ${_inferenceMs}ms  Post: ${_postprocessMs}ms', style: const TextStyle(color: Colors.white70, fontSize: 12)),
              ]
           )
         ])
