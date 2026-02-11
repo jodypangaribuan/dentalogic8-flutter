@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
-import 'dart:isolate';
+import 'dart:io'; 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
@@ -10,6 +11,7 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 const int kInputSize = 640;
 const int kNumClasses = 7;
 const int kNumAnchors = 8400;
+const int kNumFeatures = 4 + kNumClasses; // 11
 const double kConfThreshold = 0.25;
 const double kIouThreshold = 0.45;
 
@@ -34,6 +36,7 @@ class DetectionResult {
 }
 
 // ─── Isolate preprocessing ────────────────────────────────────────
+// Must be top-level and sendable
 class PreprocessRequest {
   final Uint8List yPlane;
   final Uint8List uPlane;
@@ -44,13 +47,12 @@ class PreprocessRequest {
       this.width, this.height, this.yRowStride, this.uvRowStride, this.uvPixelStride);
 }
 
-/// Run in isolate: YUV420 → float32 NHWC [1,640,640,3]
-List<List<List<List<double>>>> preprocessInIsolate(PreprocessRequest r) {
-  // Create NHWC tensor: [1][640][640][3]
-  final tensor = List.generate(1, (_) =>
-    List.generate(kInputSize, (_) =>
-      List.generate(kInputSize, (_) =>
-        List.filled(3, 0.0))));
+/// Run in isolate/compute: YUV420 → Float32List (Flat NHWC [1,640,640,3])
+/// Returns flat array to avoid serialization overhead of List<List<...>>
+Float32List preprocessInIsolate(PreprocessRequest r) {
+  // Total floats: 1 * 640 * 640 * 3
+  final totalElements = kInputSize * kInputSize * 3;
+  final float32Data = Float32List(totalElements);
 
   for (int outY = 0; outY < kInputSize; outY++) {
     final int srcY = (outY * r.height) ~/ kInputSize;
@@ -62,6 +64,7 @@ List<List<List<List<double>>>> preprocessInIsolate(PreprocessRequest r) {
       final int yIdx = yRowBase + srcX;
       final int uvIdx = uvRow + (srcX ~/ 2) * r.uvPixelStride;
 
+      // Bound checks
       if (yIdx >= r.yPlane.length || uvIdx >= r.uPlane.length || uvIdx >= r.vPlane.length) continue;
 
       final int yVal = r.yPlane[yIdx];
@@ -73,25 +76,34 @@ List<List<List<List<double>>>> preprocessInIsolate(PreprocessRequest r) {
       int green = (yVal - 0.337633 * (uVal - 128) - 0.698001 * (vVal - 128)).round().clamp(0, 255);
       int blue = (yVal + 1.732446 * (uVal - 128)).round().clamp(0, 255);
 
-      tensor[0][outY][outX][0] = red / 255.0;
-      tensor[0][outY][outX][1] = green / 255.0;
-      tensor[0][outY][outX][2] = blue / 255.0;
+      // NHWC data layout: [y][x][c]
+      // Flat index = y * width * 3 + x * 3 + c
+      final int pixelIdx = (outY * kInputSize + outX) * 3;
+      float32Data[pixelIdx] = red / 255.0;
+      float32Data[pixelIdx + 1] = green / 255.0;
+      float32Data[pixelIdx + 2] = blue / 255.0;
     }
   }
-  return tensor;
+  return float32Data;
 }
 
 // ─── Post-processing (NMS) ────────────────────────────────────────
-List<DetectionResult> postProcess(List<List<List<double>>> rawOutput) {
-  // rawOutput shape: [1][11][8400] → access [0] = [11][8400]
-  final output = rawOutput[0]; // [11][8400]
+List<DetectionResult> postProcess(Float32List output) {
+  // output is flat [1, 11, 8400] -> [11][8400] effectively
+  // Stride logic:
+  // dim 0 (batch): size 1
+  // dim 1 (features): size 11. Stride: 8400
+  // dim 2 (anchors): size 8400. Stride: 1
+  // Value at [features=f, anchor=a] is output[f * 8400 + a]
+
   List<DetectionResult> dets = [];
 
   for (int j = 0; j < kNumAnchors; j++) {
     double maxScore = 0;
     int maxClassId = 0;
+    // Classes start at feature index 4 (0-3 are box)
     for (int c = 0; c < kNumClasses; c++) {
-      final score = output[4 + c][j];
+      final score = output[(4 + c) * kNumAnchors + j];
       if (score > maxScore) {
         maxScore = score;
         maxClassId = c;
@@ -99,10 +111,10 @@ List<DetectionResult> postProcess(List<List<List<double>>> rawOutput) {
     }
     if (maxScore < kConfThreshold) continue;
 
-    final cx = output[0][j] / kInputSize;
-    final cy = output[1][j] / kInputSize;
-    final w = output[2][j] / kInputSize;
-    final h = output[3][j] / kInputSize;
+    final cx = output[0 * kNumAnchors + j] / kInputSize;
+    final cy = output[1 * kNumAnchors + j] / kInputSize;
+    final w = output[2 * kNumAnchors + j] / kInputSize;
+    final h = output[3 * kNumAnchors + j] / kInputSize;
 
     dets.add(DetectionResult(cx - w / 2, cy - h / 2, w, h, maxClassId, maxScore));
   }
@@ -137,7 +149,12 @@ late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  cameras = await availableCameras();
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    debugPrint('Camera init error: $e');
+    cameras = [];
+  }
   runApp(const DentalCariesApp());
 }
 
@@ -163,6 +180,7 @@ class DentalCariesApp extends StatelessWidget {
 }
 
 // ─── Home Screen ──────────────────────────────────────────────────
+// (Same as before)
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
   @override
@@ -198,33 +216,6 @@ class HomeScreen extends StatelessWidget {
                 const SizedBox(height: 12),
                 Text('Real-time AI detection using YOLO', textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 16, color: Colors.white.withValues(alpha: 0.6))),
-                const SizedBox(height: 48),
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF161B22),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('DETECTION CLASSES', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
-                          letterSpacing: 1.2, color: Colors.white.withValues(alpha: 0.5))),
-                      const SizedBox(height: 12),
-                      Wrap(spacing: 8, runSpacing: 8, children: List.generate(7, (i) => Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: classColors[i].withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: classColors[i].withValues(alpha: 0.4)),
-                        ),
-                        child: Text('${classNames[i]}: ${classDescriptions[i]}',
-                            style: TextStyle(fontSize: 12, color: classColors[i], fontWeight: FontWeight.w500)),
-                      ))),
-                    ],
-                  ),
-                ),
                 const Spacer(flex: 2),
                 SizedBox(
                   width: double.infinity, height: 56,
@@ -259,6 +250,9 @@ class DetectionScreen extends StatefulWidget {
 class _DetectionScreenState extends State<DetectionScreen> {
   CameraController? _cameraController;
   Interpreter? _interpreter;
+  Tensor? _inputTensor;
+  Tensor? _outputTensor;
+  
   bool _isModelLoaded = false;
   bool _isProcessing = false;
   List<DetectionResult> _detections = [];
@@ -284,24 +278,20 @@ class _DetectionScreenState extends State<DetectionScreen> {
       setState(() => _statusMessage = 'Loading model...');
 
       final options = InterpreterOptions()..threads = 4;
-      // Try GPU delegate
-      try {
-        options.addDelegate(GpuDelegateV2());
-        debugPrint('✅ GPU delegate added');
-      } catch (_) {
-        debugPrint('⚠️ GPU delegate not available, using CPU');
-      }
+      if (Platform.isAndroid) options.addDelegate(GpuDelegateV2());
+      if (Platform.isIOS) options.addDelegate(GpuDelegate()); // Metal
 
       _interpreter = await Interpreter.fromAsset(
         'assets/models/best_float16.tflite',
         options: options,
       );
 
-      // Log tensor info
-      final inTensors = _interpreter!.getInputTensors();
-      final outTensors = _interpreter!.getOutputTensors();
-      debugPrint('Input: ${inTensors.map((t) => '${t.name} ${t.shape}').join(', ')}');
-      debugPrint('Output: ${outTensors.map((t) => '${t.name} ${t.shape}').join(', ')}');
+      // Cache tensor references for faster access
+      _inputTensor = _interpreter!.getInputTensors().first;
+      _outputTensor = _interpreter!.getOutputTensors().first;
+
+      debugPrint('Model Input: ${_inputTensor?.shape}');
+      debugPrint('Model Output: ${_outputTensor?.shape}');
 
       setState(() {
         _isModelLoaded = true;
@@ -344,7 +334,8 @@ class _DetectionScreenState extends State<DetectionScreen> {
   Future<void> _processFrame(CameraImage image) async {
     final sw = Stopwatch()..start();
     try {
-      // Copy planes before async gap
+      if (image.planes.length < 3) throw Exception('Invalid planes');
+      
       final req = PreprocessRequest(
         Uint8List.fromList(image.planes[0].bytes),
         Uint8List.fromList(image.planes[1].bytes),
@@ -355,21 +346,26 @@ class _DetectionScreenState extends State<DetectionScreen> {
         image.planes[1].bytesPerPixel ?? 1,
       );
 
-      // Preprocess in isolate (YUV → NHWC float tensor)
-      final inputTensor = await Isolate.run(() => preprocessInIsolate(req));
+      // 1. Isolate: Convert YUV -> Float32List (Zero-copy transfer if possible, but compute serializes)
+      // compute() ensures no closure capture of 'this'
+      final Float32List inputData = await compute(preprocessInIsolate, req);
 
       if (_interpreter == null || !mounted) { _isProcessing = false; return; }
 
-      // Allocate output buffer: [1][11][8400]
-      final output = List.generate(1, (_) =>
-        List.generate(11, (_) =>
-          List.filled(8400, 0.0)));
+      // 2. Inference: Zero-copy inputs if possible
+      // Copy float data to input tensor buffer
+      _inputTensor!.setTo(inputData.buffer.asUint8List());
 
-      // Run inference
-      _interpreter!.run(inputTensor, output);
+      // Run
+      _interpreter!.invoke();
 
-      // Post-process
-      final detections = postProcess(output);
+      // 3. Get Output
+      // Allocate buffer for output: 1 * 11 * 8400 floats
+      final floatOutput = Float32List(1 * 11 * 8400);
+      _outputTensor!.copyTo(floatOutput.buffer.asUint8List());
+
+      // 4. Post-process (on main thread - fast enough for 8400 items)
+      final detections = postProcess(floatOutput);
 
       sw.stop();
       if (mounted) {
@@ -389,7 +385,9 @@ class _DetectionScreenState extends State<DetectionScreen> {
     } catch (e) {
       debugPrint('Processing error: $e');
     } finally {
-      _isProcessing = false;
+      if (mounted) {
+        _isProcessing = false;
+      }
     }
   }
 
