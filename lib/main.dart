@@ -1,39 +1,26 @@
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:isolate';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
-import 'package:onnxruntime/onnxruntime.dart';
-import 'package:image/image.dart' as img;
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 // ─── Model Constants ──────────────────────────────────────────────
 const int kInputSize = 640;
 const int kNumClasses = 7;
-const int kNumOutputs = 8400; // number of detection anchors
-const double kConfThreshold = 0.45;
-const double kIouThreshold = 0.5;
+const int kNumAnchors = 8400;
+const double kConfThreshold = 0.25;
+const double kIouThreshold = 0.45;
 
 const List<String> classNames = ['D0', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6'];
 const List<String> classDescriptions = [
-  'No Caries',
-  'Initial Lesion',
-  'Enamel Caries',
-  'Dentin Caries',
-  'Deep Caries',
-  'Pulp Involvement',
-  'Root Caries',
+  'No Caries', 'Initial Lesion', 'Enamel Caries',
+  'Dentin Caries', 'Deep Caries', 'Pulp Involvement', 'Root Caries',
 ];
-
-// Severity colors: green (healthy) → red (severe)
 const List<Color> classColors = [
-  Color(0xFF4CAF50), // D0 - Green
-  Color(0xFF8BC34A), // D1 - Light Green
-  Color(0xFFFFEB3B), // D2 - Yellow
-  Color(0xFFFF9800), // D3 - Orange
-  Color(0xFFFF5722), // D4 - Deep Orange
-  Color(0xFFF44336), // D5 - Red
-  Color(0xFF9C27B0), // D6 - Purple
+  Color(0xFF4CAF50), Color(0xFF8BC34A), Color(0xFFFFEB3B),
+  Color(0xFFFF9800), Color(0xFFFF5722), Color(0xFFF44336), Color(0xFF9C27B0),
 ];
 
 // ─── Detection Result ─────────────────────────────────────────────
@@ -41,19 +28,108 @@ class DetectionResult {
   final double x, y, w, h;
   final int classId;
   final double confidence;
-
-  DetectionResult({
-    required this.x,
-    required this.y,
-    required this.w,
-    required this.h,
-    required this.classId,
-    required this.confidence,
-  });
-
+  DetectionResult(this.x, this.y, this.w, this.h, this.classId, this.confidence);
   String get className => classNames[classId];
-  String get description => classDescriptions[classId];
   Color get color => classColors[classId];
+}
+
+// ─── Isolate preprocessing ────────────────────────────────────────
+class PreprocessRequest {
+  final Uint8List yPlane;
+  final Uint8List uPlane;
+  final Uint8List vPlane;
+  final int width, height;
+  final int yRowStride, uvRowStride, uvPixelStride;
+  PreprocessRequest(this.yPlane, this.uPlane, this.vPlane,
+      this.width, this.height, this.yRowStride, this.uvRowStride, this.uvPixelStride);
+}
+
+/// Run in isolate: YUV420 → float32 NHWC [1,640,640,3]
+List<List<List<List<double>>>> preprocessInIsolate(PreprocessRequest r) {
+  // Create NHWC tensor: [1][640][640][3]
+  final tensor = List.generate(1, (_) =>
+    List.generate(kInputSize, (_) =>
+      List.generate(kInputSize, (_) =>
+        List.filled(3, 0.0))));
+
+  for (int outY = 0; outY < kInputSize; outY++) {
+    final int srcY = (outY * r.height) ~/ kInputSize;
+    final int yRowBase = srcY * r.yRowStride;
+    final int uvRow = (srcY ~/ 2) * r.uvRowStride;
+
+    for (int outX = 0; outX < kInputSize; outX++) {
+      final int srcX = (outX * r.width) ~/ kInputSize;
+      final int yIdx = yRowBase + srcX;
+      final int uvIdx = uvRow + (srcX ~/ 2) * r.uvPixelStride;
+
+      if (yIdx >= r.yPlane.length || uvIdx >= r.uPlane.length || uvIdx >= r.vPlane.length) continue;
+
+      final int yVal = r.yPlane[yIdx];
+      final int uVal = r.uPlane[uvIdx];
+      final int vVal = r.vPlane[uvIdx];
+
+      // YUV → RGB (BT.601)
+      int red = (yVal + 1.370705 * (vVal - 128)).round().clamp(0, 255);
+      int green = (yVal - 0.337633 * (uVal - 128) - 0.698001 * (vVal - 128)).round().clamp(0, 255);
+      int blue = (yVal + 1.732446 * (uVal - 128)).round().clamp(0, 255);
+
+      tensor[0][outY][outX][0] = red / 255.0;
+      tensor[0][outY][outX][1] = green / 255.0;
+      tensor[0][outY][outX][2] = blue / 255.0;
+    }
+  }
+  return tensor;
+}
+
+// ─── Post-processing (NMS) ────────────────────────────────────────
+List<DetectionResult> postProcess(List<List<List<double>>> rawOutput) {
+  // rawOutput shape: [1][11][8400] → access [0] = [11][8400]
+  final output = rawOutput[0]; // [11][8400]
+  List<DetectionResult> dets = [];
+
+  for (int j = 0; j < kNumAnchors; j++) {
+    double maxScore = 0;
+    int maxClassId = 0;
+    for (int c = 0; c < kNumClasses; c++) {
+      final score = output[4 + c][j];
+      if (score > maxScore) {
+        maxScore = score;
+        maxClassId = c;
+      }
+    }
+    if (maxScore < kConfThreshold) continue;
+
+    final cx = output[0][j] / kInputSize;
+    final cy = output[1][j] / kInputSize;
+    final w = output[2][j] / kInputSize;
+    final h = output[3][j] / kInputSize;
+
+    dets.add(DetectionResult(cx - w / 2, cy - h / 2, w, h, maxClassId, maxScore));
+  }
+
+  // NMS
+  if (dets.isEmpty) return [];
+  dets.sort((a, b) => b.confidence.compareTo(a.confidence));
+  List<DetectionResult> result = [];
+  List<bool> suppressed = List.filled(dets.length, false);
+  for (int i = 0; i < dets.length; i++) {
+    if (suppressed[i]) continue;
+    result.add(dets[i]);
+    for (int j = i + 1; j < dets.length; j++) {
+      if (suppressed[j]) continue;
+      if (_iou(dets[i], dets[j]) > kIouThreshold) suppressed[j] = true;
+    }
+  }
+  return result;
+}
+
+double _iou(DetectionResult a, DetectionResult b) {
+  final x1 = max(a.x, b.x);
+  final y1 = max(a.y, b.y);
+  final x2 = min(a.x + a.w, b.x + b.w);
+  final y2 = min(a.y + a.h, b.y + b.h);
+  final inter = max(0.0, x2 - x1) * max(0.0, y2 - y1);
+  return inter / (a.w * a.h + b.w * b.h - inter + 1e-6);
 }
 
 // ─── App Entry ────────────────────────────────────────────────────
@@ -62,14 +138,11 @@ late List<CameraDescription> cameras;
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   cameras = await availableCameras();
-  OrtEnv.instance.init();
   runApp(const DentalCariesApp());
 }
 
-// ─── App Root ─────────────────────────────────────────────────────
 class DentalCariesApp extends StatelessWidget {
   const DentalCariesApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -77,14 +150,12 @@ class DentalCariesApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
-        primarySwatch: Colors.teal,
         scaffoldBackgroundColor: const Color(0xFF0D1117),
-        colorScheme: ColorScheme.dark(
-          primary: const Color(0xFF58A6FF),
-          secondary: const Color(0xFF79C0FF),
-          surface: const Color(0xFF161B22),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF58A6FF),
+          secondary: Color(0xFF79C0FF),
+          surface: Color(0xFF161B22),
         ),
-        fontFamily: 'Roboto',
       ),
       home: const HomeScreen(),
     );
@@ -94,7 +165,6 @@ class DentalCariesApp extends StatelessWidget {
 // ─── Home Screen ──────────────────────────────────────────────────
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -113,141 +183,60 @@ class HomeScreen extends StatelessWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 const Spacer(flex: 2),
-                // App icon
                 Container(
-                  width: 120,
-                  height: 120,
+                  width: 120, height: 120,
                   decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF58A6FF), Color(0xFF79C0FF)],
-                    ),
+                    gradient: const LinearGradient(colors: [Color(0xFF58A6FF), Color(0xFF79C0FF)]),
                     borderRadius: BorderRadius.circular(30),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF58A6FF).withValues(alpha: 0.3),
-                        blurRadius: 30,
-                        spreadRadius: 5,
-                      ),
-                    ],
+                    boxShadow: [BoxShadow(color: const Color(0xFF58A6FF).withValues(alpha: 0.3), blurRadius: 30, spreadRadius: 5)],
                   ),
-                  child: const Icon(
-                    Icons.medical_services_rounded,
-                    size: 60,
-                    color: Colors.white,
-                  ),
+                  child: const Icon(Icons.medical_services_rounded, size: 60, color: Colors.white),
                 ),
                 const SizedBox(height: 32),
-                // Title
-                const Text(
-                  'Dental Caries\nDetector',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 36,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                    letterSpacing: -0.5,
-                    height: 1.2,
-                  ),
-                ),
+                const Text('Dental Caries\nDetector', textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Colors.white, height: 1.2)),
                 const SizedBox(height: 12),
-                Text(
-                  'Real-time AI-powered detection using YOLO',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: Colors.white.withValues(alpha: 0.6),
-                  ),
-                ),
+                Text('Real-time AI detection using YOLO', textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 16, color: Colors.white.withValues(alpha: 0.6))),
                 const SizedBox(height: 48),
-                // Class legend
                 Container(
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
                     color: const Color(0xFF161B22),
                     borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.08),
-                    ),
+                    border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'DETECTION CLASSES',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          letterSpacing: 1.2,
-                          color: Colors.white.withValues(alpha: 0.5),
-                        ),
-                      ),
+                      Text('DETECTION CLASSES', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+                          letterSpacing: 1.2, color: Colors.white.withValues(alpha: 0.5))),
                       const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: List.generate(kNumClasses, (i) {
-                          return Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 6,
-                            ),
-                            decoration: BoxDecoration(
-                              color: classColors[i].withValues(alpha: 0.15),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: classColors[i].withValues(alpha: 0.4),
-                              ),
-                            ),
-                            child: Text(
-                              '${classNames[i]}: ${classDescriptions[i]}',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: classColors[i],
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                          );
-                        }),
-                      ),
+                      Wrap(spacing: 8, runSpacing: 8, children: List.generate(7, (i) => Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: classColors[i].withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: classColors[i].withValues(alpha: 0.4)),
+                        ),
+                        child: Text('${classNames[i]}: ${classDescriptions[i]}',
+                            style: TextStyle(fontSize: 12, color: classColors[i], fontWeight: FontWeight.w500)),
+                      ))),
                     ],
                   ),
                 ),
                 const Spacer(flex: 2),
-                // Start button
                 SizedBox(
-                  width: double.infinity,
-                  height: 56,
+                  width: double.infinity, height: 56,
                   child: ElevatedButton(
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const DetectionScreen(),
-                        ),
-                      );
-                    },
+                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DetectionScreen())),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF58A6FF),
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      elevation: 0,
-                    ),
-                    child: const Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.camera_alt_rounded, size: 24),
-                        SizedBox(width: 12),
-                        Text(
-                          'Start Detection',
-                          style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
+                      backgroundColor: const Color(0xFF58A6FF), foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)), elevation: 0),
+                    child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      Icon(Icons.camera_alt_rounded, size: 24), SizedBox(width: 12),
+                      Text('Start Detection', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                    ]),
                   ),
                 ),
                 const SizedBox(height: 32),
@@ -263,290 +252,152 @@ class HomeScreen extends StatelessWidget {
 // ─── Detection Screen ─────────────────────────────────────────────
 class DetectionScreen extends StatefulWidget {
   const DetectionScreen({super.key});
-
   @override
   State<DetectionScreen> createState() => _DetectionScreenState();
 }
 
 class _DetectionScreenState extends State<DetectionScreen> {
   CameraController? _cameraController;
-  OrtSession? _session;
+  Interpreter? _interpreter;
   bool _isModelLoaded = false;
   bool _isProcessing = false;
   List<DetectionResult> _detections = [];
-  String _statusMessage = 'Loading model...';
+  String _statusMessage = 'Loading...';
   int _fps = 0;
   int _frameCount = 0;
   DateTime _lastFpsTime = DateTime.now();
+  int _inferenceMs = 0;
 
   @override
   void initState() {
     super.initState();
-    _initModel();
+    _initAll();
   }
 
-  Future<void> _initModel() async {
+  Future<void> _initAll() async {
+    await _loadModel();
+    await _initCamera();
+  }
+
+  Future<void> _loadModel() async {
     try {
-      // Load model
-      setState(() => _statusMessage = 'Loading ONNX model...');
-      final sessionOptions = OrtSessionOptions();
-      final rawAsset = await rootBundle.load('assets/models/best.onnx');
-      final bytes = rawAsset.buffer.asUint8List();
-      _session = OrtSession.fromBuffer(bytes, sessionOptions);
+      setState(() => _statusMessage = 'Loading model...');
+
+      final options = InterpreterOptions()..threads = 4;
+      // Try GPU delegate
+      try {
+        options.addDelegate(GpuDelegateV2());
+        debugPrint('✅ GPU delegate added');
+      } catch (_) {
+        debugPrint('⚠️ GPU delegate not available, using CPU');
+      }
+
+      _interpreter = await Interpreter.fromAsset(
+        'assets/models/best_float16.tflite',
+        options: options,
+      );
+
+      // Log tensor info
+      final inTensors = _interpreter!.getInputTensors();
+      final outTensors = _interpreter!.getOutputTensors();
+      debugPrint('Input: ${inTensors.map((t) => '${t.name} ${t.shape}').join(', ')}');
+      debugPrint('Output: ${outTensors.map((t) => '${t.name} ${t.shape}').join(', ')}');
 
       setState(() {
         _isModelLoaded = true;
-        _statusMessage = 'Model loaded. Starting camera...';
+        _statusMessage = 'Model ready!';
       });
-
-      // Init camera
-      await _initCamera();
     } catch (e) {
-      setState(() => _statusMessage = 'Error loading model: $e');
+      debugPrint('Model load error: $e');
+      setState(() => _statusMessage = 'Model error: $e');
     }
   }
 
   Future<void> _initCamera() async {
     if (cameras.isEmpty) {
-      setState(() => _statusMessage = 'No cameras available');
+      setState(() => _statusMessage = 'No cameras');
       return;
     }
-
-    // Use the back camera
-    final camera = cameras.firstWhere(
+    final cam = cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => cameras.first,
     );
-
-    _cameraController = CameraController(
-      camera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-
+    _cameraController = CameraController(cam, ResolutionPreset.medium, enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420);
     try {
       await _cameraController!.initialize();
-      setState(() => _statusMessage = 'Detecting...');
-
-      // Start image stream
-      _cameraController!.startImageStream(_onCameraFrame);
+      if (mounted) {
+        setState(() => _statusMessage = 'Detecting...');
+        _cameraController!.startImageStream(_onFrame);
+      }
     } catch (e) {
       setState(() => _statusMessage = 'Camera error: $e');
     }
   }
 
-  void _onCameraFrame(CameraImage cameraImage) {
-    if (_isProcessing || !_isModelLoaded) return;
+  void _onFrame(CameraImage image) {
+    if (_isProcessing || !_isModelLoaded || _interpreter == null) return;
     _isProcessing = true;
-    _processFrame(cameraImage);
+    _processFrame(image);
   }
 
-  Future<void> _processFrame(CameraImage cameraImage) async {
+  Future<void> _processFrame(CameraImage image) async {
+    final sw = Stopwatch()..start();
     try {
-      // Convert camera image to RGB and resize to 640x640
-      final inputData = _preprocessImage(cameraImage);
-
-      // Create input tensor [1, 3, 640, 640]
-      final inputOrt = OrtValueTensor.createTensorWithDataList(
-        Float32List.fromList(inputData),
-        [1, 3, kInputSize, kInputSize],
+      // Copy planes before async gap
+      final req = PreprocessRequest(
+        Uint8List.fromList(image.planes[0].bytes),
+        Uint8List.fromList(image.planes[1].bytes),
+        Uint8List.fromList(image.planes[2].bytes),
+        image.width, image.height,
+        image.planes[0].bytesPerRow,
+        image.planes[1].bytesPerRow,
+        image.planes[1].bytesPerPixel ?? 1,
       );
 
-      final inputs = {'images': inputOrt};
-      final runOptions = OrtRunOptions();
+      // Preprocess in isolate (YUV → NHWC float tensor)
+      final inputTensor = await Isolate.run(() => preprocessInIsolate(req));
+
+      if (_interpreter == null || !mounted) { _isProcessing = false; return; }
+
+      // Allocate output buffer: [1][11][8400]
+      final output = List.generate(1, (_) =>
+        List.generate(11, (_) =>
+          List.filled(8400, 0.0)));
 
       // Run inference
-      final outputs = await _session?.runAsync(runOptions, inputs);
+      _interpreter!.run(inputTensor, output);
 
-      if (outputs != null && outputs.isNotEmpty) {
-        final outputTensor = outputs[0];
-        if (outputTensor != null) {
-          final outputData = outputTensor.value as List;
-          final detections = _postProcess(outputData);
+      // Post-process
+      final detections = postProcess(output);
 
-          if (mounted) {
-            setState(() {
-              _detections = detections;
-              _updateFps();
-            });
+      sw.stop();
+      if (mounted) {
+        setState(() {
+          _detections = detections;
+          _inferenceMs = sw.elapsedMilliseconds;
+          _frameCount++;
+          final now = DateTime.now();
+          final elapsed = now.difference(_lastFpsTime).inMilliseconds;
+          if (elapsed >= 1000) {
+            _fps = (_frameCount * 1000 / elapsed).round();
+            _frameCount = 0;
+            _lastFpsTime = now;
           }
-          outputTensor.release();
-        }
+        });
       }
-
-      inputOrt.release();
-      runOptions.release();
     } catch (e) {
-      // Silently handle frame processing errors
+      debugPrint('Processing error: $e');
     } finally {
       _isProcessing = false;
     }
   }
 
-  void _updateFps() {
-    _frameCount++;
-    final now = DateTime.now();
-    final elapsed = now.difference(_lastFpsTime).inMilliseconds;
-    if (elapsed >= 1000) {
-      _fps = (_frameCount * 1000 / elapsed).round();
-      _frameCount = 0;
-      _lastFpsTime = now;
-    }
-  }
-
-  /// Converts YUV420 camera image to a normalized float32 list in CHW format
-  List<double> _preprocessImage(CameraImage image) {
-    // Convert YUV420 to RGB
-    final int width = image.width;
-    final int height = image.height;
-
-    final yPlane = image.planes[0].bytes;
-    final uPlane = image.planes[1].bytes;
-    final vPlane = image.planes[2].bytes;
-    final int uvRowStride = image.planes[1].bytesPerRow;
-    final int uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
-
-    // Create an image and resize
-    final rgbImage = img.Image(width: width, height: height);
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        final int yIndex = y * image.planes[0].bytesPerRow + x;
-        final int uvIndex = (y ~/ 2) * uvRowStride + (x ~/ 2) * uvPixelStride;
-
-        final int yVal = yPlane[yIndex];
-        final int uVal = uPlane[uvIndex];
-        final int vVal = vPlane[uvIndex];
-
-        int r = (yVal + 1.370705 * (vVal - 128)).round().clamp(0, 255);
-        int g =
-            (yVal - 0.337633 * (uVal - 128) - 0.698001 * (vVal - 128))
-                .round()
-                .clamp(0, 255);
-        int b = (yVal + 1.732446 * (uVal - 128)).round().clamp(0, 255);
-
-        rgbImage.setPixelRgba(x, y, r, g, b, 255);
-      }
-    }
-
-    // Resize to 640x640
-    final resized = img.copyResize(
-      rgbImage,
-      width: kInputSize,
-      height: kInputSize,
-      interpolation: img.Interpolation.linear,
-    );
-
-    // Convert to CHW format normalized to [0, 1]
-    final float32Data = List<double>.filled(3 * kInputSize * kInputSize, 0);
-    for (int y = 0; y < kInputSize; y++) {
-      for (int x = 0; x < kInputSize; x++) {
-        final pixel = resized.getPixel(x, y);
-        final idx = y * kInputSize + x;
-        float32Data[0 * kInputSize * kInputSize + idx] = pixel.r / 255.0; // R
-        float32Data[1 * kInputSize * kInputSize + idx] = pixel.g / 255.0; // G
-        float32Data[2 * kInputSize * kInputSize + idx] = pixel.b / 255.0; // B
-      }
-    }
-
-    return float32Data;
-  }
-
-  /// Post-process YOLO output [1, 11, 8400] → list of detections
-  /// Format: 11 = 4 (x_center, y_center, w, h) + 7 (class scores)
-  List<DetectionResult> _postProcess(List outputData) {
-    // outputData is [1][11][8400] → flatten to get the 2D [11][8400]
-    final List<List<double>> output = [];
-    final batch = outputData[0]; // [11][8400]
-
-    for (int i = 0; i < 11; i++) {
-      final row = batch[i];
-      final List<double> rowData = [];
-      for (int j = 0; j < kNumOutputs; j++) {
-        rowData.add((row[j] as num).toDouble());
-      }
-      output.add(rowData);
-    }
-
-    // Gather raw detections
-    List<DetectionResult> rawDetections = [];
-
-    for (int j = 0; j < kNumOutputs; j++) {
-      // Find max class score
-      double maxScore = 0;
-      int maxClassId = 0;
-      for (int c = 0; c < kNumClasses; c++) {
-        final score = output[4 + c][j];
-        if (score > maxScore) {
-          maxScore = score;
-          maxClassId = c;
-        }
-      }
-
-      if (maxScore >= kConfThreshold) {
-        final cx = output[0][j] / kInputSize;
-        final cy = output[1][j] / kInputSize;
-        final w = output[2][j] / kInputSize;
-        final h = output[3][j] / kInputSize;
-
-        rawDetections.add(DetectionResult(
-          x: cx - w / 2,
-          y: cy - h / 2,
-          w: w,
-          h: h,
-          classId: maxClassId,
-          confidence: maxScore,
-        ));
-      }
-    }
-
-    // Non-Maximum Suppression
-    return _nms(rawDetections, kIouThreshold);
-  }
-
-  List<DetectionResult> _nms(List<DetectionResult> dets, double iouThresh) {
-    if (dets.isEmpty) return [];
-
-    // Sort by confidence descending
-    dets.sort((a, b) => b.confidence.compareTo(a.confidence));
-
-    List<DetectionResult> result = [];
-
-    List<bool> suppressed = List.filled(dets.length, false);
-
-    for (int i = 0; i < dets.length; i++) {
-      if (suppressed[i]) continue;
-      result.add(dets[i]);
-
-      for (int j = i + 1; j < dets.length; j++) {
-        if (suppressed[j]) continue;
-        if (_iou(dets[i], dets[j]) > iouThresh) {
-          suppressed[j] = true;
-        }
-      }
-    }
-
-    return result;
-  }
-
-  double _iou(DetectionResult a, DetectionResult b) {
-    final x1 = max(a.x, b.x);
-    final y1 = max(a.y, b.y);
-    final x2 = min(a.x + a.w, b.x + b.w);
-    final y2 = min(a.y + a.h, b.y + b.h);
-
-    final interArea = max(0.0, x2 - x1) * max(0.0, y2 - y1);
-    final aArea = a.w * a.h;
-    final bArea = b.w * b.h;
-
-    return interArea / (aArea + bArea - interArea + 1e-6);
-  }
-
   @override
   void dispose() {
+    _cameraController?.stopImageStream();
     _cameraController?.dispose();
-    _session?.release();
+    _interpreter?.close();
     super.dispose();
   }
 
@@ -554,419 +405,159 @@ class _DetectionScreenState extends State<DetectionScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          // Camera preview
-          if (_cameraController != null &&
-              _cameraController!.value.isInitialized)
-            _buildCameraPreview()
-          else
-            Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const CircularProgressIndicator(color: Color(0xFF58A6FF)),
-                  const SizedBox(height: 16),
-                  Text(
-                    _statusMessage,
-                    style: const TextStyle(color: Colors.white70, fontSize: 16),
-                  ),
-                ],
-              ),
-            ),
+      body: Stack(fit: StackFit.expand, children: [
+        if (_cameraController != null && _cameraController!.value.isInitialized)
+          SizedBox.expand(child: FittedBox(fit: BoxFit.cover, child: SizedBox(
+            width: _cameraController!.value.previewSize!.height,
+            height: _cameraController!.value.previewSize!.width,
+            child: CameraPreview(_cameraController!),
+          )))
+        else
+          Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const CircularProgressIndicator(color: Color(0xFF58A6FF)),
+            const SizedBox(height: 16),
+            Text(_statusMessage, style: const TextStyle(color: Colors.white70, fontSize: 16)),
+          ])),
 
-          // Bounding box overlay
-          if (_cameraController != null &&
-              _cameraController!.value.isInitialized)
-            _buildDetectionOverlay(),
+        // Bounding boxes
+        if (_cameraController != null && _cameraController!.value.isInitialized)
+          LayoutBuilder(builder: (ctx, constraints) => CustomPaint(
+            size: Size(constraints.maxWidth, constraints.maxHeight),
+            painter: _BoxPainter(detections: _detections),
+          )),
 
-          // Top bar
-          _buildTopBar(),
-
-          // Bottom stats bar
-          _buildBottomBar(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCameraPreview() {
-    final size = MediaQuery.of(context).size;
-    final previewSize = _cameraController!.value.previewSize!;
-    final previewAspect = previewSize.height / previewSize.width;
-
-    return Center(
-      child: AspectRatio(
-        aspectRatio: previewAspect,
-        child: CameraPreview(_cameraController!),
-      ),
-    );
-  }
-
-  Widget _buildDetectionOverlay() {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        return CustomPaint(
-          size: Size(constraints.maxWidth, constraints.maxHeight),
-          painter: DetectionPainter(
-            detections: _detections,
-            previewSize: _cameraController!.value.previewSize!,
-            screenSize: Size(constraints.maxWidth, constraints.maxHeight),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildTopBar() {
-    return Positioned(
-      top: 0,
-      left: 0,
-      right: 0,
-      child: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [
-              Colors.black.withValues(alpha: 0.7),
-              Colors.transparent,
-            ],
-          ),
-        ),
-        child: SafeArea(
-          bottom: false,
-          child: Padding(
+        // Top bar
+        Positioned(top: 0, left: 0, right: 0, child: Container(
+          decoration: BoxDecoration(gradient: LinearGradient(
+            begin: Alignment.topCenter, end: Alignment.bottomCenter,
+            colors: [Colors.black.withValues(alpha: 0.7), Colors.transparent],
+          )),
+          child: SafeArea(bottom: false, child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              children: [
-                // Back button
-                Container(
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: IconButton(
-                    icon: const Icon(Icons.arrow_back_ios_new, size: 20),
-                    color: Colors.white,
-                    onPressed: () => Navigator.pop(context),
-                  ),
+            child: Row(children: [
+              Container(
+                decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(12)),
+                child: IconButton(icon: const Icon(Icons.arrow_back_ios_new, size: 20), color: Colors.white,
+                    onPressed: () => Navigator.pop(context)),
+              ),
+              const SizedBox(width: 12),
+              const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Live Detection', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                Text('Dental Caries • YOLO • Real-time', style: TextStyle(color: Colors.white60, fontSize: 12)),
+              ]),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(8)),
+                child: Text('${_inferenceMs}ms', style: const TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.w500)),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF4CAF50).withValues(alpha: 0.2), borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFF4CAF50).withValues(alpha: 0.5)),
                 ),
-                const SizedBox(width: 12),
-                // Title
-                const Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Live Detection',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    Text(
-                      'Dental Caries • YOLO',
-                      style: TextStyle(color: Colors.white60, fontSize: 12),
-                    ),
-                  ],
-                ),
-                const Spacer(),
-                // FPS badge
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color:
-                        _fps > 10
-                            ? const Color(0xFF4CAF50).withValues(alpha: 0.2)
-                            : const Color(0xFFFF5722).withValues(alpha: 0.2),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color:
-                          _fps > 10
-                              ? const Color(0xFF4CAF50).withValues(alpha: 0.5)
-                              : const Color(0xFFFF5722).withValues(alpha: 0.5),
-                    ),
-                  ),
-                  child: Text(
-                    '$_fps FPS',
-                    style: TextStyle(
-                      color: _fps > 10
-                          ? const Color(0xFF4CAF50)
-                          : const Color(0xFFFF5722),
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+                child: Text('$_fps FPS', style: const TextStyle(color: Color(0xFF4CAF50), fontSize: 12, fontWeight: FontWeight.w600)),
+              ),
+            ]),
+          )),
+        )),
 
-  Widget _buildBottomBar() {
-    final detectionCount = _detections.length;
-    // Get unique classes detected
-    final classSet = _detections.map((d) => d.classId).toSet();
-
-    return Positioned(
-      bottom: 0,
-      left: 0,
-      right: 0,
-      child: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.bottomCenter,
-            end: Alignment.topCenter,
-            colors: [
-              Colors.black.withValues(alpha: 0.85),
-              Colors.transparent,
-            ],
-          ),
-        ),
-        child: SafeArea(
-          top: false,
-          child: Padding(
+        // Bottom bar
+        Positioned(bottom: 0, left: 0, right: 0, child: Container(
+          decoration: BoxDecoration(gradient: LinearGradient(
+            begin: Alignment.bottomCenter, end: Alignment.topCenter,
+            colors: [Colors.black.withValues(alpha: 0.85), Colors.transparent],
+          )),
+          child: SafeArea(top: false, child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 40, 16, 16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Detection chips
-                if (_detections.isNotEmpty)
-                  SizedBox(
-                    height: 36,
-                    child: ListView.separated(
-                      scrollDirection: Axis.horizontal,
-                      itemCount: _detections.length,
-                      separatorBuilder: (_, __) => const SizedBox(width: 8),
-                      itemBuilder: (context, index) {
-                        final det = _detections[index];
-                        return Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: det.color.withValues(alpha: 0.2),
-                            borderRadius: BorderRadius.circular(18),
-                            border: Border.all(
-                              color: det.color.withValues(alpha: 0.6),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Container(
-                                width: 8,
-                                height: 8,
-                                decoration: BoxDecoration(
-                                  color: det.color,
-                                  shape: BoxShape.circle,
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                '${det.className} ${(det.confidence * 100).toStringAsFixed(0)}%',
-                                style: TextStyle(
-                                  color: det.color,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              if (_detections.isNotEmpty) SizedBox(height: 36, child: ListView.separated(
+                scrollDirection: Axis.horizontal, itemCount: _detections.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 8),
+                itemBuilder: (_, i) {
+                  final d = _detections[i];
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: d.color.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: d.color.withValues(alpha: 0.6)),
                     ),
-                  ),
-                const SizedBox(height: 12),
-                // Stats row
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [
-                    _buildStatItem(
-                      Icons.search,
-                      '$detectionCount',
-                      'Detected',
-                    ),
-                    _buildStatItem(
-                      Icons.category,
-                      '${classSet.length}',
-                      'Classes',
-                    ),
-                    _buildStatItem(
-                      Icons.speed,
-                      '$_fps',
-                      'FPS',
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      Container(width: 8, height: 8, decoration: BoxDecoration(color: d.color, shape: BoxShape.circle)),
+                      const SizedBox(width: 6),
+                      Text('${d.className} ${(d.confidence * 100).toStringAsFixed(0)}%',
+                          style: TextStyle(color: d.color, fontSize: 13, fontWeight: FontWeight.w600)),
+                    ]),
+                  );
+                },
+              )),
+              const SizedBox(height: 12),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                _stat(Icons.search, '${_detections.length}', 'Detected'),
+                _stat(Icons.category, '${_detections.map((d) => d.classId).toSet().length}', 'Classes'),
+                _stat(Icons.speed, '$_fps', 'FPS'),
+              ]),
+            ]),
+          )),
+        )),
+      ]),
     );
   }
 
-  Widget _buildStatItem(IconData icon, String value, String label) {
-    return Column(
-      children: [
-        Icon(icon, color: const Color(0xFF58A6FF), size: 20),
-        const SizedBox(height: 4),
-        Text(
-          value,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        Text(
-          label,
-          style: const TextStyle(color: Colors.white54, fontSize: 12),
-        ),
-      ],
-    );
-  }
+  Widget _stat(IconData icon, String value, String label) => Column(children: [
+    Icon(icon, color: const Color(0xFF58A6FF), size: 20),
+    const SizedBox(height: 4),
+    Text(value, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+    Text(label, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+  ]);
 }
 
-// ─── Detection Painter ────────────────────────────────────────────
-class DetectionPainter extends CustomPainter {
+// ─── Bounding Box Painter ─────────────────────────────────────────
+class _BoxPainter extends CustomPainter {
   final List<DetectionResult> detections;
-  final Size previewSize;
-  final Size screenSize;
-
-  DetectionPainter({
-    required this.detections,
-    required this.previewSize,
-    required this.screenSize,
-  });
+  _BoxPainter({required this.detections});
 
   @override
   void paint(Canvas canvas, Size size) {
     for (final det in detections) {
-      final paint = Paint()
-        ..color = det.color
-        ..strokeWidth = 2.5
-        ..style = PaintingStyle.stroke;
-
-      // Scale normalized coords to screen
       final left = det.x * size.width;
       final top = det.y * size.height;
       final right = (det.x + det.w) * size.width;
       final bottom = (det.y + det.h) * size.height;
-
       final rect = Rect.fromLTRB(left, top, right, bottom);
 
-      // Draw rounded bounding box
-      final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(6));
-      canvas.drawRRect(rrect, paint);
+      canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(6)),
+          Paint()..color = det.color..strokeWidth = 2.5..style = PaintingStyle.stroke);
 
-      // Draw corner accents
-      _drawCornerAccents(canvas, rect, det.color);
+      // Corners
+      final cp = Paint()..color = det.color..strokeWidth = 3.5..style = PaintingStyle.stroke..strokeCap = StrokeCap.round;
+      const c = 14.0;
+      canvas.drawLine(Offset(rect.left, rect.top + c), Offset(rect.left, rect.top), cp);
+      canvas.drawLine(Offset(rect.left, rect.top), Offset(rect.left + c, rect.top), cp);
+      canvas.drawLine(Offset(rect.right - c, rect.top), Offset(rect.right, rect.top), cp);
+      canvas.drawLine(Offset(rect.right, rect.top), Offset(rect.right, rect.top + c), cp);
+      canvas.drawLine(Offset(rect.left, rect.bottom - c), Offset(rect.left, rect.bottom), cp);
+      canvas.drawLine(Offset(rect.left, rect.bottom), Offset(rect.left + c, rect.bottom), cp);
+      canvas.drawLine(Offset(rect.right - c, rect.bottom), Offset(rect.right, rect.bottom), cp);
+      canvas.drawLine(Offset(rect.right, rect.bottom), Offset(rect.right, rect.bottom - c), cp);
 
-      // Draw label background
-      final label =
-          '${det.className} ${(det.confidence * 100).toStringAsFixed(0)}%';
-      final textSpan = TextSpan(
-        text: label,
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 13,
-          fontWeight: FontWeight.w600,
-        ),
-      );
-      final textPainter = TextPainter(
-        text: textSpan,
+      // Label
+      final label = '${det.className} ${(det.confidence * 100).toStringAsFixed(0)}%';
+      final tp = TextPainter(
+        text: TextSpan(text: label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
         textDirection: TextDirection.ltr,
       )..layout();
-
-      final labelWidth = textPainter.width + 16;
-      final labelHeight = textPainter.height + 8;
-
-      final labelRect = RRect.fromRectAndRadius(
-        Rect.fromLTWH(left, top - labelHeight - 4, labelWidth, labelHeight),
-        const Radius.circular(6),
-      );
-
-      final bgPaint = Paint()..color = det.color;
-      canvas.drawRRect(labelRect, bgPaint);
-
-      textPainter.paint(
-        canvas,
-        Offset(left + 8, top - labelHeight - 4 + 4),
-      );
+      final lw = tp.width + 16;
+      final lh = tp.height + 8;
+      final ly = (top - lh - 4).clamp(0.0, size.height - lh);
+      canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(left, ly, lw, lh), const Radius.circular(6)),
+          Paint()..color = det.color);
+      tp.paint(canvas, Offset(left + 8, ly + 4));
     }
   }
 
-  void _drawCornerAccents(Canvas canvas, Rect rect, Color color) {
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = 3.5
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
-
-    const cornerLen = 14.0;
-
-    // Top-left
-    canvas.drawLine(
-      Offset(rect.left, rect.top + cornerLen),
-      Offset(rect.left, rect.top),
-      paint,
-    );
-    canvas.drawLine(
-      Offset(rect.left, rect.top),
-      Offset(rect.left + cornerLen, rect.top),
-      paint,
-    );
-
-    // Top-right
-    canvas.drawLine(
-      Offset(rect.right - cornerLen, rect.top),
-      Offset(rect.right, rect.top),
-      paint,
-    );
-    canvas.drawLine(
-      Offset(rect.right, rect.top),
-      Offset(rect.right, rect.top + cornerLen),
-      paint,
-    );
-
-    // Bottom-left
-    canvas.drawLine(
-      Offset(rect.left, rect.bottom - cornerLen),
-      Offset(rect.left, rect.bottom),
-      paint,
-    );
-    canvas.drawLine(
-      Offset(rect.left, rect.bottom),
-      Offset(rect.left + cornerLen, rect.bottom),
-      paint,
-    );
-
-    // Bottom-right
-    canvas.drawLine(
-      Offset(rect.right - cornerLen, rect.bottom),
-      Offset(rect.right, rect.bottom),
-      paint,
-    );
-    canvas.drawLine(
-      Offset(rect.right, rect.bottom),
-      Offset(rect.right, rect.bottom - cornerLen),
-      paint,
-    );
-  }
-
   @override
-  bool shouldRepaint(covariant DetectionPainter oldDelegate) {
-    return oldDelegate.detections != detections;
-  }
+  bool shouldRepaint(covariant _BoxPainter old) => old.detections != detections;
 }
