@@ -27,9 +27,11 @@ class FrameRequest {
   final int width, height;
   final int yRowStride, uvRowStride, uvPixelStride;
   final int rotation;
+  final bool isFrontCamera;
 
   FrameRequest(this.id, this.yPlane, this.uPlane, this.vPlane,
-      this.width, this.height, this.yRowStride, this.uvRowStride, this.uvPixelStride, this.rotation);
+      this.width, this.height, this.yRowStride, this.uvRowStride, this.uvPixelStride, this.rotation,
+      {this.isFrontCamera = false});
 }
 
 class ImageFileRequest {
@@ -89,7 +91,7 @@ class PredictionService {
     });
   }
 
-  void processFrame(CameraImage image, int rotation) {
+  void processFrame(CameraImage image, int rotation, {bool isFrontCamera = false}) {
     if (_isolateSendPort == null) return;
 
     final req = FrameRequest(
@@ -101,7 +103,8 @@ class PredictionService {
       image.planes[0].bytesPerRow,
       image.planes[1].bytesPerRow,
       image.planes[1].bytesPerPixel ?? 1,
-      rotation
+      rotation,
+      isFrontCamera: isFrontCamera,
     );
     
     _isolateSendPort!.send(req);
@@ -204,7 +207,28 @@ void _isolateEntry(InitRequest initReq) async {
          inferenceTime = swInf.elapsedMilliseconds;
          
          final swPost = Stopwatch()..start();
-         final detections = _postProcess(outputBuffer);
+         var detections = _postProcess(outputBuffer);
+         
+         // Fix front camera mirroring (flip X)
+         if (message.isFrontCamera) {
+            detections = detections.map((d) {
+              // Normalized coordinates: x is top-left.
+              // Flip relative to center (0.5) or just 1.0 - x - w?
+              // Standard mirror: x_new = 1.0 - (x + w)
+              // Let's verify:
+              // Left object (x=0.1, w=0.2) -> Right object (x=0.7, w=0.2)
+              // 1.0 - (0.1 + 0.2) = 0.7. Correct.
+              return DetectionResult(
+                1.0 - (d.x + d.w), 
+                d.y, 
+                d.w, 
+                d.h, 
+                d.classId, 
+                d.confidence
+              );
+            }).toList();
+         }
+         
          swPost.stop();
          postprocessTime = swPost.elapsedMilliseconds;
          

@@ -99,8 +99,9 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     // Adjust for front camera mirroring if needed?
     // TFLite usually needs rotation relative to sensor.
     // For now passing rotation assuming backend handles it as per main.dart logic.
+    final bool isFront = _cameras[_cameraIndex].lensDirection == CameraLensDirection.front;
 
-    _predictionService.processFrame(image, rotation);
+    _predictionService.processFrame(image, rotation, isFrontCamera: isFront);
   }
 
   Future<void> _toggleCamera() async {
@@ -120,23 +121,31 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     }
   }
 
-
-
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _cameraController?.dispose();
+    _stopCamera();
     _predictionService.dispose();
     super.dispose();
   }
   
+  Future<void> _stopCamera() async {
+    if (_cameraController != null) {
+      if (_cameraController!.value.isStreamingImages) {
+        await _cameraController!.stopImageStream();
+      }
+      await _cameraController!.dispose();
+      _cameraController = null;
+    }
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Handle camera resource release/acquire on background/foreground
-    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    // if (_cameraController == null || !_cameraController!.value.isInitialized) return;
     
     if (state == AppLifecycleState.inactive) {
-      _cameraController?.dispose();
+      _stopCamera();
     } else if (state == AppLifecycleState.resumed) {
       _initializeCamera();
     }
