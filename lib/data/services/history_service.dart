@@ -1,4 +1,5 @@
 
+import 'package:flutter/foundation.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/history_item.dart';
@@ -15,7 +16,7 @@ class HistoryService {
       final List<dynamic> jsonList = jsonDecode(jsonString);
       return jsonList.map((j) => HistoryItem.fromJson(j)).toList();
     } catch (e) {
-      print('Error decoding history: $e');
+      debugPrint('Error decoding history: $e');
       return [];
     }
   }

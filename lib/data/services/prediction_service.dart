@@ -3,8 +3,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
-import 'dart:typed_data';
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
@@ -147,10 +147,10 @@ void _isolateEntry(InitRequest initReq) async {
     
     inputTensorStream = interpreterStream.getInputTensors().first;
     outputTensorStream = interpreterStream.getOutputTensors().first;
-    print("Stream Model: ${inputTensorStream.type} (CPU)");
+    debugPrint("Stream Model: ${inputTensorStream.type} (CPU)");
 
   } catch (e) {
-    print("Stream Init Error: $e");
+    debugPrint("Stream Init Error: $e");
   }
 
   // --- Setup Static Interpreter (Int8) ---
@@ -162,10 +162,10 @@ void _isolateEntry(InitRequest initReq) async {
     
     inputTensorStatic = interpreterStatic.getInputTensors().first;
     outputTensorStatic = interpreterStatic.getOutputTensors().first;
-    print("Static Model: ${inputTensorStatic.type} (Int8)");
+    debugPrint("Static Model: ${inputTensorStatic.type} (Int8)");
 
   } catch (e) {
-    print("Static Init Error: $e");
+    debugPrint("Static Init Error: $e");
   }
 
   // Pre-allocate buffers for Int8 and Float32
@@ -291,7 +291,7 @@ void _isolateEntry(InitRequest initReq) async {
          ));
       }
     } catch (e) {
-      print("Pipeline Error: $e");
+      debugPrint("Pipeline Error: $e");
     }
   }
 }
@@ -328,11 +328,11 @@ void _preprocessCommon(FrameRequest req, Function(int r, int g, int b, int offse
     // Portrait Up
     for (int outY = 0; outY < kInputSize; outY++) {
       final int srcX = (outY * inW) ~/ kInputSize;
-      final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
+      final int srcXClamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
       for (int outX = 0; outX < kInputSize; outX++) {
          final int srcY = ((kInputSize - 1 - outX) * inH) ~/ kInputSize;
-         final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
-         _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+         final int srcYClamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
+         _convertPixel(yPlane, uPlane, vPlane, srcXClamped, srcYClamped, 
              yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
          pixelIdx += 3;
       }
@@ -341,11 +341,11 @@ void _preprocessCommon(FrameRequest req, Function(int r, int g, int b, int offse
     // Portrait Down
     for (int outY = 0; outY < kInputSize; outY++) {
       final int srcX = ((kInputSize - 1 - outY) * inW) ~/ kInputSize;
-      final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
+      final int srcXClamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
       for (int outX = 0; outX < kInputSize; outX++) {
         final int srcY = (outX * inH) ~/ kInputSize;
-        final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
-        _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+        final int srcYClamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
+        _convertPixel(yPlane, uPlane, vPlane, srcXClamped, srcYClamped, 
              yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
         pixelIdx += 3;
       }
@@ -354,11 +354,11 @@ void _preprocessCommon(FrameRequest req, Function(int r, int g, int b, int offse
      // Landscape Right
      for (int outY = 0; outY < kInputSize; outY++) {
        final int srcY = ((kInputSize - 1 - outY) * inH) ~/ kInputSize;
-       final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
+       final int srcYClamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
        for (int outX = 0; outX < kInputSize; outX++) {
          final int srcX = ((kInputSize - 1 - outX) * inW) ~/ kInputSize;
-         final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
-         _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+         final int srcXClamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
+         _convertPixel(yPlane, uPlane, vPlane, srcXClamped, srcYClamped, 
              yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
          pixelIdx += 3;
        }
@@ -367,11 +367,11 @@ void _preprocessCommon(FrameRequest req, Function(int r, int g, int b, int offse
     // Landscape Left (0)
     for (int outY = 0; outY < kInputSize; outY++) {
       final int srcY = (outY * inH) ~/ kInputSize;
-      final int srcY_clamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
+      final int srcYClamped = srcY < 0 ? 0 : (srcY > inH_1 ? inH_1 : srcY);
       for (int outX = 0; outX < kInputSize; outX++) {
         final int srcX = (outX * inW) ~/ kInputSize;
-        final int srcX_clamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
-        _convertPixel(yPlane, uPlane, vPlane, srcX_clamped, srcY_clamped, 
+        final int srcXClamped = srcX < 0 ? 0 : (srcX > inW_1 ? inW_1 : srcX);
+        _convertPixel(yPlane, uPlane, vPlane, srcXClamped, srcYClamped, 
              yRowStride, uvRowStride, uvPixelStride, pixelIdx, storePixel);
         pixelIdx += 3;
       }
@@ -397,9 +397,21 @@ void _convertPixel(
   int g = yVal - ((352 * uVal + 731 * vVal) >> 10);
   int b = yVal + ((1814 * uVal) >> 10);
 
-  if (r < 0) r = 0; else if (r > 255) r = 255;
-  if (g < 0) g = 0; else if (g > 255) g = 255;
-  if (b < 0) b = 0; else if (b > 255) b = 255;
+  if (r < 0) {
+    r = 0;
+  } else if (r > 255) {
+    r = 255;
+  }
+  if (g < 0) {
+    g = 0;
+  } else if (g > 255) {
+    g = 255;
+  }
+  if (b < 0) {
+    b = 0;
+  } else if (b > 255) {
+    b = 255;
+  }
   
   storePixel(r, g, b, outOffset);
 }
