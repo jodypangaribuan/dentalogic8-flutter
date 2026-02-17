@@ -9,6 +9,7 @@ import '../../data/models/history_item.dart';
 import '../../data/services/history_service.dart';
 import '../../data/services/onnx_prediction_service.dart';
 import '../../widgets/bounding_box_painter.dart';
+import '../../widgets/premium_widgets.dart';
 import 'package:uuid/uuid.dart';
 
 class AnalysisDetailScreen extends StatefulWidget {
@@ -45,6 +46,12 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
   bool _isAnalyzing = true;
   bool _isSaved = false;
   TreatmentInfo? _treatmentInfo;
+
+  // Get the color for a specific class
+  Color _colorForClass(String cls) => treatmentData[cls]?.color ?? AppColors.primary;
+
+  // Main label color
+  Color get _labelColor => _colorForClass(_label);
 
   @override
   void initState() {
@@ -194,7 +201,7 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
         ],
       ),
       body: _isAnalyzing
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(child: PremiumLoadingSpinner(message: 'Menganalisis gigi...'))
           : Stack(
               children: [
                 SingleChildScrollView(
@@ -210,12 +217,8 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
                         _buildDetectionDistribution(),
                         const SizedBox(height: 16),
                       ],
-                      _buildTreatmentCard(),
+                      _buildAllTreatments(),
                       const SizedBox(height: 16),
-                      if (_detectedClasses.length > 1) ...[
-                        _buildOtherTreatments(),
-                        const SizedBox(height: 16),
-                      ],
                       _buildDisclaimer(),
                       const SizedBox(height: 40),
                     ],
@@ -250,14 +253,14 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
 
                       return SizedBox(
                         width: containerWidth,
-                        height: displayHeight.clamp(150.0, 300.0),
+                        height: displayHeight,
                         child: Stack(
                           children: [
                             Image.file(
                               File(widget.imageUri),
                               fit: BoxFit.contain,
                               width: containerWidth,
-                              height: displayHeight.clamp(150.0, 300.0),
+                              height: displayHeight,
                             ),
                             Positioned.fill(
                               child: CustomPaint(
@@ -311,7 +314,7 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
               Container(
                 width: 60, height: 60,
                 decoration: BoxDecoration(
-                  color: AppColors.primary,
+                  color: _labelColor,
                   borderRadius: BorderRadius.circular(16),
                 ),
                 child: Center(
@@ -351,7 +354,7 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
               widthFactor: _confidence.clamp(0.0, 1.0),
               child: Container(
                 decoration: BoxDecoration(
-                  color: AppColors.primary,
+                  color: _labelColor,
                   borderRadius: BorderRadius.circular(5),
                 ),
               ),
@@ -398,6 +401,7 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
               return Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: ['D0', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6'].map((cls) {
+                  final clsColor = _colorForClass(cls);
                   final count = stats[cls] ?? 0;
                   final isActive = count > 0;
                   return SizedBox(
@@ -405,9 +409,9 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
                     child: Container(
                       padding: const EdgeInsets.symmetric(vertical: 10),
                       decoration: BoxDecoration(
-                        color: isActive ? AppColors.primary : const Color(0xFFF8FAFC),
+                        color: isActive ? clsColor : const Color(0xFFF8FAFC),
                         borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: isActive ? AppColors.primary : const Color(0xFFE2E8F0)),
+                        border: Border.all(color: isActive ? clsColor : const Color(0xFFE2E8F0)),
                       ),
                       child: Column(
                         children: [
@@ -426,144 +430,94 @@ class _AnalysisDetailScreenState extends State<AnalysisDetailScreen> {
     );
   }
 
-  // ── Treatment Recommendations ──
-  Widget _buildTreatmentCard() {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 8, offset: const Offset(0, 2)),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Section header with icon
-          Row(
-            children: [
-              Icon(Icons.medical_services, size: 20, color: AppColors.primary),
-              const SizedBox(width: 8),
-              const Text('Rekomendasi Penanganan', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.text)),
+  // ── All Treatment Recommendations ──
+  Widget _buildAllTreatments() {
+    // Get all unique detected classes, sorted by severity (highest first)
+    final classesToShow = _detectedClasses.isNotEmpty ? _detectedClasses : [_label];
+    final stats = _detectionStats;
+
+    debugPrint('Treatment: label=$_label, detectedClasses=$classesToShow, stats=$stats');
+
+    return Column(
+      children: classesToShow.map((cls) {
+        final info = treatmentData[cls];
+        if (info == null) {
+          debugPrint('Treatment: No treatmentData for class $cls');
+          return const SizedBox.shrink();
+        }
+        final clsColor = _colorForClass(cls);
+        final count = stats[cls] ?? 0;
+        final isPrimary = cls == _label;
+
+        return Container(
+          margin: const EdgeInsets.only(bottom: 16),
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 8, offset: const Offset(0, 2)),
             ],
           ),
-          const SizedBox(height: 16),
-          ...(_treatmentInfo?.treatment.asMap().entries.map((entry) {
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header: badge + title
+              Row(
                 children: [
                   Container(
-                    width: 24, height: 24,
-                    decoration: const BoxDecoration(
-                      color: AppColors.primary,
-                      shape: BoxShape.circle,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: clsColor,
+                      borderRadius: BorderRadius.circular(8),
                     ),
-                    child: Center(
-                      child: Text('${entry.key + 1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 12)),
-                    ),
+                    child: Text(cls, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.white)),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 10),
                   Expanded(
-                    child: Text(entry.value, style: const TextStyle(fontSize: 14, color: Color(0xFF475569), height: 1.4)),
+                    child: Text(
+                      isPrimary
+                          ? 'Rekomendasi Penanganan'
+                          : '${info.severity} ($count terdeteksi)',
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.text),
+                    ),
                   ),
                 ],
               ),
-            );
-          }).toList() ?? []),
-        ],
-      ),
-    );
-  }
-
-  // ── Other Detected Class Treatments ──
-  Widget _buildOtherTreatments() {
-    final stats = _detectionStats;
-    final otherClasses = _detectedClasses.where((cls) => cls != _label).toList();
-
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 8, offset: const Offset(0, 2)),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Penanganan Karies Lainnya', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.text)),
-          ...otherClasses.map((cls) {
-            final info = treatmentData[cls]!;
-            final count = stats[cls] ?? 0;
-            return Container(
-              margin: const EdgeInsets.only(top: 12),
-              padding: const EdgeInsets.only(top: 16),
-              decoration: const BoxDecoration(
-                border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // Header: badge + title
-                  Row(
+              const SizedBox(height: 12),
+              Text(info.description, style: const TextStyle(fontSize: 13, color: Color(0xFF64748B), height: 1.5)),
+              const SizedBox(height: 14),
+              // Numbered treatment items
+              ...info.treatment.asMap().entries.map((entry) {
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        width: 22, height: 22,
                         decoration: BoxDecoration(
-                          color: AppColors.primary,
-                          borderRadius: BorderRadius.circular(8),
+                          color: clsColor,
+                          shape: BoxShape.circle,
                         ),
-                        child: Text(cls, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.white)),
+                        child: Center(
+                          child: Text('${entry.key + 1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 11)),
+                        ),
                       ),
                       const SizedBox(width: 10),
                       Expanded(
-                        child: Text(
-                          '${info.severity} ($count terdeteksi)',
-                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.text),
-                        ),
+                        child: Text(entry.value, style: const TextStyle(fontSize: 13, color: Color(0xFF475569), height: 1.4)),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 8),
-                  Text(info.description, style: const TextStyle(fontSize: 13, color: Color(0xFF64748B), height: 1.5)),
-                  const SizedBox(height: 10),
-                  // First 3 treatments with bullet points
-                  ...info.treatment.take(3).map((t) {
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Container(
-                            width: 6, height: 6,
-                            margin: const EdgeInsets.only(top: 6),
-                            decoration: BoxDecoration(
-                              color: AppColors.primary,
-                              borderRadius: BorderRadius.circular(3),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(t, style: const TextStyle(fontSize: 13, color: Color(0xFF64748B))),
-                          ),
-                        ],
-                      ),
-                    );
-                  }),
-                ],
-              ),
-            );
-          }),
-        ],
-      ),
+                );
+              }),
+            ],
+          ),
+        );
+      }).toList(),
     );
   }
-
-
 
   // ── Disclaimer ──
   Widget _buildDisclaimer() {

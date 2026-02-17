@@ -52,6 +52,28 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _handleTakePhoto() async {
+    try {
+      final ImagePicker picker = ImagePicker();
+      final XFile? image = await picker.pickImage(source: ImageSource.camera);
+      
+      if (image != null && mounted) {
+        Navigator.pushNamed(
+          context,
+          '/analysis-detail',
+          arguments: {'imageUri': image.path, 'source': 'camera'}
+        );
+      }
+    } catch (e) {
+      debugPrint('Error taking photo: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Gagal mengambil foto: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -76,7 +98,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 icon: Icons.camera_alt,
                 iconColor: AppColors.primary,
                 iconBgColor: const Color(0xFFE0F2FE),
-                onTap: () => Navigator.pushNamed(context, '/scan'),
+                onTap: _handleTakePhoto,
               ),
               
               const SizedBox(height: 16),

@@ -8,6 +8,7 @@ import 'dart:io';
 import '../../data/services/prediction_service.dart';
 import '../../data/models/detection.dart';
 import '../../widgets/bounding_box_painter.dart';
+import '../../widgets/premium_widgets.dart';
 
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
@@ -23,7 +24,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   final PredictionService _predictionService = PredictionService();
   
   List<DetectionResult> _detections = [];
-  int _inferenceMs = 0;
   
   bool _flashOn = false;
   int _cameraIndex = 0; // 0 for back, 1 for front usually
@@ -43,7 +43,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() {
         _detections = result.detections;
-        _inferenceMs = result.inferenceOnlyTime;
         _isDetecting = false;
       });
     });
@@ -121,44 +120,7 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _takePicture() async {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
-    if (_cameraController!.value.isTakingPicture) return;
 
-    try {
-      // Pause stream to capture
-      await _cameraController!.stopImageStream();
-      
-      final XFile file = await _cameraController!.takePicture();
-      
-      if (mounted) {
-        // Navigate to Detail Screen
-        Navigator.pushNamed(
-          context, 
-          '/analysis-detail',
-          arguments: {
-             'imageUri': file.path, 
-             'source': 'camera', 
-             'detections': _detections // Pass current detections if we want to show them immediately? 
-                                          // Or let detail screen re-run on high-res image?
-                                          // Better to let Detail re-run on the high-res image for accuracy.
-             // Actually, DetailScreen needs to run prediction on the static image.
-          }
-        ).then((_) {
-          // Restart stream when coming back
-          if (mounted && _cameraController != null) {
-            _cameraController!.startImageStream(_onFrame);
-          }
-        });
-      }
-    } catch (e) {
-      debugPrint('Capture Error: $e');
-      // Restart if failed and validated
-      try {
-         _cameraController?.startImageStream(_onFrame);
-      } catch (_) {}
-    }
-  }
 
   @override
   void dispose() {
@@ -183,7 +145,7 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return const Scaffold(backgroundColor: Colors.black, body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(backgroundColor: Colors.black, body: Center(child: PremiumLoadingSpinner(color: Colors.white, message: 'Menyiapkan kamera...')));
     }
 
     final size = MediaQuery.of(context).size;
@@ -233,19 +195,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
                         ),
                       ),
                       
-                      // FPS / Stats
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: Colors.black45,
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Text(
-                          '${_inferenceMs > 0 ? (1000/_inferenceMs).toStringAsFixed(1) : "0"} FPS (${_inferenceMs}ms)',
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
-                        ),
-                      ),
-                      
                       Row(
                         children: [
                           IconButton(
@@ -264,37 +213,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
                     ],
                   ),
                 ),
-                
-                // Bottom Controls
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 40),
-                  child: Row(
-                     mainAxisAlignment: MainAxisAlignment.center,
-                     children: [
-                        // Capture Button
-                        GestureDetector(
-                          onTap: _takePicture,
-                          child: Container(
-                             width: 80, height: 80,
-                             decoration: BoxDecoration(
-                               shape: BoxShape.circle,
-                               border: Border.all(color: Colors.white, width: 4),
-                               color: Colors.white24
-                             ),
-                             child: Center(
-                               child: Container(
-                                 width: 60, height: 60,
-                                 decoration: const BoxDecoration(
-                                    color: Colors.white,
-                                    shape: BoxShape.circle,
-                                 ),
-                               ),
-                             ),
-                          ),
-                        ) 
-                     ],
-                  ),
-                )
               ],
             ),
           ),

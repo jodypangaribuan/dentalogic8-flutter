@@ -1,6 +1,7 @@
 
 import 'package:flutter/material.dart';
 import '../core/theme.dart';
+import 'premium_widgets.dart';
 
 class ActionCard extends StatelessWidget {
   final String title;
@@ -103,7 +104,7 @@ class SecondaryActionCard extends StatelessWidget {
                 shape: BoxShape.circle,
               ),
               child: isLoading 
-                ? const Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2)) 
+                ? const Padding(padding: EdgeInsets.all(8), child: PremiumLoadingSpinner(size: 20, color: AppColors.primary)) 
                 : Icon(icon, size: 20, color: AppColors.textSecondary),
             ),
             const SizedBox(width: 12),
