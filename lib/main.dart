@@ -68,9 +68,25 @@ class MainTabScaffold extends StatefulWidget {
 }
 
 class _MainTabScaffoldState extends State<MainTabScaffold> {
+  late PersistentTabController _controller;
+  int _lastSelectedTab = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = PersistentTabController(initialIndex: 0);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return PersistentTabView(
+      controller: _controller,
       tabs: [
         PersistentTabConfig(
           screen: const HomeScreen(),
@@ -117,7 +133,11 @@ class _MainTabScaffoldState extends State<MainTabScaffold> {
       ),
       onTabChanged: (index) {
         if (index == 1) {
+           // Revert to previous tab so the bottom nav state doesn't change to "Scan"
+           _controller.jumpToTab(_lastSelectedTab);
            Navigator.pushNamed(context, '/scan');
+        } else {
+           _lastSelectedTab = index;
         }
       },
     );

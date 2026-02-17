@@ -88,13 +88,14 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     _isDetecting = true;
     
     // Calculate rotation
-    // This part logic is tricky to get right across all devices, sticking to simple logic for now
-    // derived from main.dart
+    // Use sensor orientation as base (90 for back, 270 for front usually on Android)
+    final sensorOrientation = _cameras[_cameraIndex].sensorOrientation;
+    int rotation = sensorOrientation;
+    
     final deviceOrientation = _cameraController!.value.deviceOrientation;
-    int rotation = 90;
     if (deviceOrientation == DeviceOrientation.landscapeLeft) rotation = 0;
     if (deviceOrientation == DeviceOrientation.landscapeRight) rotation = 180;
-    if (deviceOrientation == DeviceOrientation.portraitDown) rotation = 270;
+    if (deviceOrientation == DeviceOrientation.portraitDown) rotation = (sensorOrientation + 180) % 360;
     
     // Adjust for front camera mirroring if needed?
     // TFLite usually needs rotation relative to sensor.
