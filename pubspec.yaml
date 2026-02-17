@@ -44,6 +44,6 @@ flutter:
 
   assets:
     - assets/models/best_float16.tflite
-    - assets/models/best_full_integer_quant.tflite
+
     - assets/models/best.onnx
     - assets/labels.txt

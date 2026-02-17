@@ -15,8 +15,7 @@ import '../../core/constants.dart';
 class InitRequest {
   final SendPort sendPort;
   final Uint8List streamModelBytes;
-  final Uint8List staticModelBytes;
-  InitRequest(this.sendPort, this.streamModelBytes, this.staticModelBytes);
+  InitRequest(this.sendPort, this.streamModelBytes);
 }
 
 class FrameRequest {
@@ -34,12 +33,7 @@ class FrameRequest {
       {this.isFrontCamera = false});
 }
 
-class ImageFileRequest {
-  final int id;
-  final String path;
-  
-  ImageFileRequest(this.id, this.path);
-}
+
 
 class InferenceResult {
   final int id;
@@ -68,15 +62,13 @@ class PredictionService {
     final streamModelData = await rootBundle.load('assets/models/best_float16.tflite');
     final streamModelBytes = streamModelData.buffer.asUint8List();
 
-    // Static Model (Int8 Quantized) - Best for CPU/Gallery
-    final staticModelData = await rootBundle.load('assets/models/best_full_integer_quant.tflite');
-    final staticModelBytes = staticModelData.buffer.asUint8List();
+
 
     // Spawn Isolate
     final receivePort = ReceivePort();
     _isolate = await Isolate.spawn(
       _isolateEntry, 
-      InitRequest(receivePort.sendPort, streamModelBytes, staticModelBytes)
+      InitRequest(receivePort.sendPort, streamModelBytes)
     );
     
     receivePort.listen((message) {
@@ -110,11 +102,7 @@ class PredictionService {
     _isolateSendPort!.send(req);
   }
   
-  void predictImageFile(String path) {
-    if (_isolateSendPort == null) return;
-    final req = ImageFileRequest(1, path);
-    _isolateSendPort!.send(req);
-  }
+
 
   void dispose() {
     _isDisposed = true;
@@ -132,11 +120,6 @@ void _isolateEntry(InitRequest initReq) async {
   Interpreter? interpreterStream;
   Tensor? inputTensorStream;
   Tensor? outputTensorStream;
-  
-  // 2. Initialize Static Interpreter (Int8 -> CPU Preferred)
-  Interpreter? interpreterStatic;
-  Tensor? inputTensorStatic;
-  Tensor? outputTensorStatic;
 
   final outputBuffer = Float32List(1 * 11 * kNumAnchors);
 
@@ -156,23 +139,9 @@ void _isolateEntry(InitRequest initReq) async {
     debugPrint("Stream Init Error: $e");
   }
 
-  // --- Setup Static Interpreter (Int8) ---
-  try {
-    // Always CPU for Int8 (XNNPACK is default and fast)
-    var options = InterpreterOptions()..threads = 4;
-    interpreterStatic = Interpreter.fromBuffer(initReq.staticModelBytes, options: options);
-    interpreterStatic.allocateTensors();
-    
-    inputTensorStatic = interpreterStatic.getInputTensors().first;
-    outputTensorStatic = interpreterStatic.getOutputTensors().first;
-    debugPrint("Static Model: ${inputTensorStatic.type} (Int8)");
 
-  } catch (e) {
-    debugPrint("Static Init Error: $e");
-  }
 
   // Pre-allocate buffers for Int8 and Float32
-  final inputIntBuffer = Uint8List(kInputSize * kInputSize * 3);
   final inputFloatBuffer = Float32List(kInputSize * kInputSize * 3);
 
   await for (final message in receivePort) {
@@ -237,82 +206,7 @@ void _isolateEntry(InitRequest initReq) async {
              preprocessTime, inferenceTime, postprocessTime
          ));
 
-      } else if (message is ImageFileRequest) {
-         if (interpreterStatic == null) continue;
-         
-         // Static Image Processing (use Static Interpreter - Int8)
-         final swPre = Stopwatch()..start();
-         
-         final file = File(message.path);
-         if (!file.existsSync()) continue;
-         
-         final bytes = await file.readAsBytes();
-         img.Image? image = img.decodeImage(bytes);
-         if (image == null) continue;
-         
-         final resized = img.copyResize(image, width: kInputSize, height: kInputSize);
-         
-         // Int8 Preprocessing
-         var pixelIndex = 0;
-         for (var y = 0; y < kInputSize; y++) {
-           for (var x = 0; x < kInputSize; x++) {
-             final pixel = resized.getPixel(x, y);
-             inputIntBuffer[pixelIndex++] = pixel.r.toInt();
-             inputIntBuffer[pixelIndex++] = pixel.g.toInt();
-             inputIntBuffer[pixelIndex++] = pixel.b.toInt();
-           }
-         }
-         
-         swPre.stop();
-         preprocessTime = swPre.elapsedMilliseconds;
-         
-         final swInf = Stopwatch()..start();
-         inputTensorStatic!.setTo(inputIntBuffer);
-         interpreterStatic.invoke();
-         
-         // Output of Int8 model might need dequantization??
-         // Usually Int8 models output Dequantized Float32 if configured, 
-         // OR they output Uint8 which needs scale/zero_point.
-         // TFLite Flutter: "outputTensor.copyTo" blindly copies bytes.
-         // If outputTensor is Float32, it copies floats.
-         // If outputTensor is Uint8, it copies ints.
-         
-         // Check output type:
-         if (outputTensorStatic!.type == TensorType.uint8) {
-            // Need to dequantize? 
-            // Or maybe the model has a dequantize head?
-            // "best_full_integer_quant.tflite" usually implies Int8/Uint8 I/O.
-            
-            // Let's assume standard Object Detection output [1, 84, 8400] is usually Float32 
-            // even in some quant models if the output layer is dequantized.
-            // If it is strictly Uint8, we need to convert.
-            
-            // Safe bet: allocation buffer size and type-check.
-            final outBytes = Uint8List(1 * 11 * kNumAnchors); // 1 byte per element? No, Uint8.
-            outputTensorStatic.copyTo(outBytes);
-            
-            // TODO: Implement Dequantization if needed.
-            // For now, let's assume it outputs Float32 (common with TFLite Metadata).
-            // Actually, let's try copyTo Float32List first. If it crashes/mismatches size, we catch error.
-            
-            outputTensorStatic.copyTo(outputBuffer.buffer.asUint8List());
-         } else {
-            // Float32 output
-            outputTensorStatic.copyTo(outputBuffer.buffer.asUint8List());
-         }
-         
-         swInf.stop();
-         inferenceTime = swInf.elapsedMilliseconds;
-         
-         final swPost = Stopwatch()..start();
-         final detections = _postProcess(outputBuffer);
-         swPost.stop();
-         postprocessTime = swPost.elapsedMilliseconds;
-         
-         initReq.sendPort.send(InferenceResult(
-             message.id, detections, preprocessTime + inferenceTime + postprocessTime,
-             preprocessTime, inferenceTime, postprocessTime
-         ));
+
       }
     } catch (e) {
       debugPrint("Pipeline Error: $e");
