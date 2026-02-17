@@ -1,7 +1,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_nav_bar/google_nav_bar.dart';
+import 'package:persistent_bottom_nav_bar_v2/persistent_bottom_nav_bar_v2.dart';
 
 import 'core/theme.dart';
 import 'features/home/home_screen.dart';
@@ -68,83 +68,58 @@ class MainTabScaffold extends StatefulWidget {
 }
 
 class _MainTabScaffoldState extends State<MainTabScaffold> {
-  int _currentIndex = 0;
-  
-  // Only Home and History in the stack. Scan is a modal action.
-  final List<Widget> _screens = [
-    const HomeScreen(),
-    const HistoryScreen(), 
-  ];
-
-  void _onItemTapped(int index) {
-    if (index == 1) {
-      // Scan Action
-      Navigator.pushNamed(context, '/scan');
-    } else {
-      // Index 0 (Home) stays 0.
-      // Index 2 (History) maps to 1 in _screens? 
-      // This mapping is annoying.
-      // Let's use indices 0, 1, 2 and a placeholder.
-      setState(() {
-        _currentIndex = index;
-      });
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: IndexedStack(
-        // Map _currentIndex to stack index.
-        // 0 -> 0
-        // 1 -> 0 (Stay on Home if somehow 1 is set?) OR just don't show 1.
-        // 2 -> 1
-        index: _currentIndex == 2 ? 1 : 0, 
-        children: _screens,
-      ),
-        bottomNavigationBar: Container(
-          decoration: BoxDecoration(
-            color: Colors.white,
-            boxShadow: [
-              BoxShadow(
-                blurRadius: 20,
-                color: Colors.black.withValues(alpha: 0.1),
-              )
-            ],
-          ),
-          child: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 15.0, vertical: 8),
-              child: GNav(
-                rippleColor: Colors.grey[300]!,
-                hoverColor: Colors.grey[100]!,
-                gap: 8,
-                activeColor: AppColors.primary,
-                iconSize: 24,
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                duration: const Duration(milliseconds: 400),
-                tabBackgroundColor: AppColors.primary.withValues(alpha: 0.1),
-                color: Colors.grey[600],
-                tabs: const [
-                  GButton(
-                    icon: Icons.home_outlined,
-                    text: 'Home',
-                  ),
-                  GButton(
-                    icon: Icons.camera_alt_outlined,
-                    text: 'Scan',
-                  ),
-                  GButton(
-                    icon: Icons.history_outlined,
-                    text: 'Riwayat',
-                  ),
-                ],
-                selectedIndex: _currentIndex,
-                onTabChange: _onItemTapped,
-              ),
-            ),
+    return PersistentTabView(
+      tabs: [
+        PersistentTabConfig(
+          screen: const HomeScreen(),
+          item: ItemConfig(
+            icon: const Icon(Icons.home),
+            title: "Home",
+            activeForegroundColor: AppColors.primary,
+            inactiveForegroundColor: Colors.grey,
           ),
         ),
+        PersistentTabConfig(
+          screen: const SizedBox(), // Scan is handled by onItemSelected
+          item: ItemConfig(
+            icon: const Icon(Icons.camera_alt),
+            title: "Scan",
+            activeForegroundColor: AppColors.primary,
+            inactiveForegroundColor: Colors.grey,
+          ),
+        ),
+        PersistentTabConfig(
+          screen: const HistoryScreen(),
+          item: ItemConfig(
+            icon: const Icon(Icons.history),
+            title: "Riwayat",
+            activeForegroundColor: AppColors.primary,
+            inactiveForegroundColor: Colors.grey,
+          ),
+        ),
+      ],
+      navBarBuilder: (navBarConfig) => Style1BottomNavBar(
+        navBarConfig: navBarConfig,
+        navBarDecoration: NavBarDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(10.0),
+          filter: null, // Optional: backdrop filter
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.1),
+              blurRadius: 10,
+              offset: const Offset(0, -2), // Shadow upwards
+            ),
+          ],
+        ),
+      ),
+      onTabChanged: (index) {
+        if (index == 1) {
+           Navigator.pushNamed(context, '/scan');
+        }
+      },
     );
   }
 }

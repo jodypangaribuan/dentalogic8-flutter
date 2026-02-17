@@ -23,7 +23,7 @@ dependencies:
   image: ^4.7.2
   flutter_onnxruntime: ^1.6.2
   shimmer: ^3.0.0
-  google_nav_bar: ^5.0.7
+  persistent_bottom_nav_bar_v2: ^6.2.0
 
 dev_dependencies:
   flutter_test:
